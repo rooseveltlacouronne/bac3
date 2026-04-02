@@ -68,3 +68,4 @@ yarn-error.log*
 # Misc
 .cache
 .parcel-cache
+credentials.json
