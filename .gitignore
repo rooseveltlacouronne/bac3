@@ -69,3 +69,4 @@ yarn-error.log*
 .cache
 .parcel-cache
 credentials.json
+venv311/
