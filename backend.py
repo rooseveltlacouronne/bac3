@@ -1054,15 +1054,14 @@ async def analyze_folder(
     establishment_id: Optional[str] = Form(None),
     threshold: float = Form(15.0),
     ws_id: str = Form(...),
-    save_to_database: bool = Form(False),  # ✅ NOUVEAU: Confirmation utilisateur
+    save_to_database: bool = Form(False),
     files: List[UploadFile] = File(...)
 ):
     """
-    Analyse complète de dossier avec:
-    - Confirmation avant enregistrement
-    - Progression temps réel
-    - Rapports PDF professionnels
-    - Structure ZIP organisée
+    Analyse complète de dossier.
+    NE génère PAS de PDF automatiquement.
+    Sauvegarde les résultats en base pour affichage tableau interactif.
+    Le PDF est généré à la demande via /api/analyses/{id}/export-pdf
     """
     analysis_id = None
     try:
@@ -1121,22 +1120,23 @@ async def analyze_folder(
             except Exception as storage_error:
                 print(f"Storage error: {storage_error}")
             
-            # ✅ Enregistrer dans BD SEULEMENT si l'utilisateur l'a demandé
-            file_id = None
-            if save_to_database:
-                file_record = supabase_client.table('files').insert({
-                    'teacher_id': teacher_id,
-                    'filename': safe_filename,
-                    'original_path': file.filename,
-                    'storage_path': storage_path,
-                    'file_type': ext,
-                    'file_size': file_size,
-                    'content_text': text[:50000],
-                    'content_hash': content_hash,
-                    'word_count': len(text.split()),
-                    'language': language
-                }).execute()
-                file_id = file_record.data[0]['id']
+            # ── Toujours enregistrer en BD pour avoir un file_id valide ──────
+            # Si save_to_database=False, on marque avec 'folder_analysis::' pour nettoyage ultérieur
+            original_path_marker = file.filename if save_to_database else f"folder_analysis::{analysis_id}::{safe_filename}"
+            
+            file_record = supabase_client.table('files').insert({
+                'teacher_id':    teacher_id,
+                'filename':      safe_filename,
+                'original_path': original_path_marker,
+                'storage_path':  storage_path,
+                'file_type':     ext,
+                'file_size':     file_size,
+                'content_text':  text[:50000],
+                'content_hash':  content_hash,
+                'word_count':    len(text.split()),
+                'language':      language
+            }).execute()
+            file_id = file_record.data[0]['id']
             
             file_records.append({
                 'id': file_id,
@@ -1189,28 +1189,32 @@ async def analyze_folder(
                 comparisons_done += 1
                 
                 if similarity >= threshold:
-                    # Créer ID temporaire si pas de BD
-                    file_a_id = file_a['id'] if file_a['id'] else f"temp_{analysis_id}_{i}"
-                    file_b_id = file_b['id'] if file_b['id'] else f"temp_{analysis_id}_{j}"
+                    # file_a['id'] et file_b['id'] sont maintenant toujours des vrais IDs BD
+                    lang = file_a['language']
+                    sim_type = f"{'Code' if lang in ['Python','Java','C','JavaScript','PHP'] else 'Texte'} — {'Exact' if similarity > 80 else 'Modéré' if similarity > 50 else 'Partiel'}"
                     
                     report = supabase_client.table('similarity_reports').insert({
-                        'analysis_id': analysis_id,
-                        'file_a_id': file_a_id if file_a['id'] else None,
-                        'file_b_id': file_b_id if file_b['id'] else None,
+                        'analysis_id':           analysis_id,
+                        'file_a_id':             file_a['id'],
+                        'file_b_id':             file_b['id'],
+                        # CORRECTION CRITIQUE: stocker les noms directement pour éviter
+                        # tout problème de jointure côté frontend
+                        'file_a_name':           file_a['filename'],
+                        'file_b_name':           file_b['filename'],
                         'similarity_percentage': similarity,
-                        'similarity_type': f"{'Code' if file_a['language'] in ['Python', 'Java', 'C', 'JavaScript', 'PHP'] else 'Texte'} - {'Exact' if similarity > 80 else 'Modéré' if similarity > 50 else 'Partiel'}",
-                        'exact_matches': details['exact_count'],
-                        'moderate_matches': details['moderate_count'],
-                        'weak_matches': details['weak_count'],
-                        'segments': json.dumps(details['segments'])
+                        'similarity_type':       sim_type,
+                        'exact_matches':         details['exact_count'],
+                        'moderate_matches':      details['moderate_count'],
+                        'weak_matches':          details['weak_count'],
+                        'segments':              json.dumps(details['segments'])
                     }).execute()
                     
                     matches.append({
                         'report_id': report.data[0]['id'],
-                        'file_a': file_a,
-                        'file_b': file_b,
+                        'file_a':    file_a,
+                        'file_b':    file_b,
                         'similarity': similarity,
-                        'details': details
+                        'details':   details
                     })
                 
                 await send_progress(ws_id, {
@@ -1219,89 +1223,10 @@ async def analyze_folder(
                     'total': comparisons_total
                 })
         
-        # ═══════════════════════════════════════════════════════════════════════════════
-        # PHASE 3: GÉNÉRATION RAPPORTS PDF (avec progression temps réel)
-        # ═══════════════════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════
+        # PHASE 3: FINALISER — pas de PDF automatique
+        # ═══════════════════════════════════════════════════════════════
         
-        if matches:
-            await send_progress(ws_id, {
-                'stage': 'report',
-                'progress': 0,
-                'total': len(matches),
-                'message': 'Génération des rapports PDF...'
-            })
-            
-            teacher = supabase_client.table('teachers').select('*').eq('id', teacher_id).execute()
-            establishment = None
-            if establishment_id:
-                establishment = supabase_client.table('establishments').select('*').eq('id', establishment_id).execute()
-            
-            for idx, match in enumerate(matches):
-                await send_progress(ws_id, {
-                    'stage': 'report',
-                    'progress': idx,
-                    'total': len(matches),
-                    'message': f'Génération rapport {idx + 1}/{len(matches)}'
-                })
-                
-                report_filename = f"rapport_similarite_{idx + 1}.pdf"
-                report_path = REPORTS_DIR / report_filename
-                
-                report_data = {
-                    'report_id': match['report_id'][:8],
-                    'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'teacher_name': teacher.data[0]['name'] if teacher.data else '',
-                    'establishment_name': establishment.data[0]['name'] if establishment and establishment.data else '',
-                    'global_similarity': match['similarity'],
-                    'total_comparisons': comparisons_total,
-                    'avg_similarity': round(sum(m['similarity'] for m in matches) / len(matches), 2),
-                    'matches_count': len(matches),
-                    'threshold': threshold,
-                    'file_a_name': match['file_a']['filename'],
-                    'file_b_name': match['file_b']['filename'],
-                    'file_a_size': match['file_a']['size'],
-                    'file_b_size': match['file_b']['size'],
-                    'file_a_words': match['file_a']['word_count'],
-                    'file_b_words': match['file_b']['word_count'],
-                    'file_a_language': match['file_a']['language'],
-                    'file_b_language': match['file_b']['language'],
-                    'exact_matches': match['details']['exact_count'],
-                    'moderate_matches': match['details']['moderate_count'],
-                    'weak_matches': match['details']['weak_count'],
-                    'similarity_type': f"{'Code' if match['file_a']['language'] in ['Python', 'Java'] else 'Texte'}",
-                    'text_a': match['file_a']['text'],
-                    'text_b': match['file_b']['text'],
-                    'segments': match['details']['segments'],
-                    'signature': hashlib.sha256(f"{match['report_id']}{datetime.now().isoformat()}".encode()).hexdigest()[:16]
-                }
-                
-                generate_pdf_report_professional(report_data, report_path)
-                
-                # Upload vers storage
-                pdf_storage_path = f"reports/{analysis_id}/dossier_{idx + 1}/{report_filename}"
-                with open(report_path, 'rb') as f:
-                    get_bucket('plagify-reports').upload(pdf_storage_path, f.read(), {'content-type': 'application/pdf', 'upsert': 'true'})
-                
-                pdf_url = get_bucket('plagify-reports').get_public_url(pdf_storage_path)
-                
-                supabase_client.table('similarity_reports').update({
-                    'report_pdf_url': pdf_url
-                }).eq('id', match['report_id']).execute()
-                
-                # Upload aussi les fichiers sources dans le même dossier
-                for file_key, file_suffix in [('file_a', 'A'), ('file_b', 'B')]:
-                    file_info = match[file_key]
-                    source_storage_path = f"reports/{analysis_id}/dossier_{idx + 1}/{file_suffix}_{file_info['filename']}"
-                    with open(file_info['path'], 'rb') as f:
-                        get_bucket('plagify-reports').upload(source_storage_path, f.read(), {'upsert': 'true'})
-                
-                await send_progress(ws_id, {
-                    'stage': 'report',
-                    'progress': idx + 1,
-                    'total': len(matches)
-                })
-        
-        # Finaliser
         supabase_client.table('analyses').update({
             'status': 'completed',
             'completed_at': datetime.now().isoformat(),
@@ -1319,7 +1244,7 @@ async def analyze_folder(
             'matches': len(matches)
         })
         
-        # Nettoyer
+        # Nettoyer fichiers temporaires
         for file_rec in file_records:
             if file_rec['path'].exists():
                 file_rec['path'].unlink()
@@ -1350,9 +1275,15 @@ async def analyze_single_file(
     establishment_id: Optional[str] = Form(None),
     threshold: float = Form(15.0),
     ws_id: str = Form(...),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    selected_file_ids: Optional[str] = Form(None)  # JSON array d'IDs sélectionnés, None = tous
 ):
-    """✅ Analyse fichier unique AVEC génération de rapports PDF"""
+    """
+    Analyse fichier unique vs base de données.
+    Si selected_file_ids est fourni (JSON array), compare uniquement avec ces fichiers.
+    Sinon compare avec toute la base.
+    NE génère PAS de PDF automatiquement — tableau interactif + export à la demande.
+    """
     analysis_id = None
     try:
         safe_filename = sanitize_filename(Path(file.filename).name)
@@ -1368,15 +1299,53 @@ async def analyze_single_file(
         
         analysis_id = analysis.data[0]['id']
         
-        # Sauvegarder le fichier
         temp_path = UPLOAD_DIR / f"{analysis_id}_{safe_filename}"
+        file_bytes = await file.read()
         with open(temp_path, 'wb') as f:
-            f.write(await file.read())
+            f.write(file_bytes)
         
         text, language = extract_text_from_file(temp_path)
+        file_size = temp_path.stat().st_size
         
-        # Récupérer fichiers BD
-        db_files = supabase_client.table('files').select('*').eq('teacher_id', teacher_id).execute()
+        # ── Enregistrer le fichier uploadé en BD pour avoir un ID distinct ──
+        # original_path = 'single_analysis::analysis_id' pour l'identifier comme temporaire
+        # Il sera associé à cette analyse uniquement
+        storage_path = f"analyses/{analysis_id}/{safe_filename}"
+        try:
+            get_bucket('plagify-files').upload(
+                storage_path, file_bytes,
+                {'content-type': 'application/octet-stream', 'upsert': 'true'}
+            )
+        except Exception as se:
+            print(f"Storage upload non critique: {se}")
+        
+        uploaded_file_record = supabase_client.table('files').insert({
+            'teacher_id':    teacher_id,
+            'filename':      safe_filename,
+            'original_path': f"single_analysis::{analysis_id}",
+            'storage_path':  storage_path,
+            'file_type':     Path(safe_filename).suffix.lower(),
+            'file_size':     file_size,
+            'content_text':  text[:50000],
+            'content_hash':  compute_hash(text),
+            'word_count':    len(text.split()),
+            'language':      language
+        }).execute()
+        
+        uploaded_file_id = uploaded_file_record.data[0]['id']
+        
+        temp_path.unlink(missing_ok=True)
+        
+        # Récupérer les fichiers à comparer (exclure le fichier qu'on vient d'insérer)
+        if selected_file_ids:
+            try:
+                ids_list = json.loads(selected_file_ids)
+                db_files = supabase_client.table('files').select('*').in_('id', ids_list).execute()
+            except:
+                db_files = supabase_client.table('files').select('*').eq('teacher_id', teacher_id).neq('id', uploaded_file_id).execute()
+        else:
+            db_files = supabase_client.table('files').select('*').eq('teacher_id', teacher_id).neq('id', uploaded_file_id).execute()
+        
         total = len(db_files.data)
         matches = []
         
@@ -1384,7 +1353,7 @@ async def analyze_single_file(
             'stage': 'comparison',
             'progress': 0,
             'total': total,
-            'message': f'Comparaison avec {total} fichiers...'
+            'message': f'Comparaison avec {total} fichier(s)...'
         })
         
         for idx, db_file in enumerate(db_files.data):
@@ -1398,23 +1367,28 @@ async def analyze_single_file(
             similarity, details = calculate_similarity(text, db_file['content_text'] or '')
             
             if similarity >= threshold:
-                report = supabase_client.table('similarity_reports').insert({
-                    'analysis_id': analysis_id,
-                    'file_a_id': db_file['id'],
-                    'file_b_id': db_file['id'],
+                supabase_client.table('similarity_reports').insert({
+                    'analysis_id':           analysis_id,
+                    'file_a_id':             uploaded_file_id,   # fichier uploadé (le vrai)
+                    'file_b_id':             db_file['id'],       # fichier de la BD
+                    # CORRECTION CRITIQUE: file_a = toujours le fichier soumis par l'enseignant
+                    # file_b = toujours le fichier de la base de données
+                    'file_a_name':           safe_filename,
+                    'file_b_name':           db_file['filename'],
                     'similarity_percentage': similarity,
-                    'similarity_type': 'Comparaison base de données',
-                    'exact_matches': details['exact_count'],
-                    'moderate_matches': details['moderate_count'],
-                    'weak_matches': details['weak_count'],
-                    'segments': json.dumps(details['segments'])
+                    'similarity_type':       'Comparaison base de données',
+                    'exact_matches':         details['exact_count'],
+                    'moderate_matches':      details['moderate_count'],
+                    'weak_matches':          details['weak_count'],
+                    'segments':              json.dumps(details['segments'])
                 }).execute()
                 
                 matches.append({
-                    'report_id': report.data[0]['id'],
-                    'db_file': db_file,
+                    'db_file':    db_file,
                     'similarity': similarity,
-                    'details': details
+                    'details':    details,
+                    'text_a':     text,
+                    'text_b':     db_file.get('content_text', '')
                 })
             
             await send_progress(ws_id, {
@@ -1423,77 +1397,13 @@ async def analyze_single_file(
                 'total': total
             })
         
-        # ✅ GÉNÉRATION DES RAPPORTS PDF (NOUVEAU)
-        if matches:
-            await send_progress(ws_id, {
-                'stage': 'report',
-                'progress': 0,
-                'total': len(matches),
-                'message': 'Génération des rapports PDF...'
-            })
-            
-            teacher = supabase_client.table('teachers').select('*').eq('id', teacher_id).execute()
-            establishment = None
-            if establishment_id:
-                establishment = supabase_client.table('establishments').select('*').eq('id', establishment_id).execute()
-            
-            for idx, match in enumerate(matches):
-                report_filename = f"rapport_similarite_{idx + 1}.pdf"
-                report_path = REPORTS_DIR / report_filename
-                
-                report_data = {
-                    'report_id': match['report_id'][:8],
-                    'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'teacher_name': teacher.data[0]['name'] if teacher.data else '',
-                    'establishment_name': establishment.data[0]['name'] if establishment and establishment.data else '',
-                    'global_similarity': match['similarity'],
-                    'total_comparisons': total,
-                    'avg_similarity': round(sum(m['similarity'] for m in matches) / len(matches), 2),
-                    'matches_count': len(matches),
-                    'threshold': threshold,
-                    'file_a_name': safe_filename,
-                    'file_b_name': match['db_file']['filename'],
-                    'file_a_size': temp_path.stat().st_size,
-                    'file_b_size': match['db_file']['file_size'],
-                    'file_a_words': len(text.split()),
-                    'file_b_words': match['db_file']['word_count'],
-                    'file_a_language': language,
-                    'file_b_language': match['db_file']['language'],
-                    'exact_matches': match['details']['exact_count'],
-                    'moderate_matches': match['details']['moderate_count'],
-                    'weak_matches': match['details']['weak_count'],
-                    'similarity_type': 'Base de données',
-                    'text_a': text,
-                    'text_b': match['db_file']['content_text'] or '',
-                    'segments': match['details']['segments'],
-                    'signature': hashlib.sha256(f"{match['report_id']}{datetime.now().isoformat()}".encode()).hexdigest()[:16]
-                }
-                
-                generate_pdf_report_professional(report_data, report_path)
-                
-                # Upload
-                pdf_storage_path = f"reports/{analysis_id}/{report_filename}"
-                with open(report_path, 'rb') as f:
-                    get_bucket('plagify-reports').upload(pdf_storage_path, f.read(), {'content-type': 'application/pdf', 'upsert': 'true'})
-                
-                pdf_url = get_bucket('plagify-reports').get_public_url(pdf_storage_path)
-                
-                supabase_client.table('similarity_reports').update({
-                    'report_pdf_url': pdf_url
-                }).eq('id', match['report_id']).execute()
-                
-                await send_progress(ws_id, {
-                    'stage': 'report',
-                    'progress': idx + 1,
-                    'total': len(matches)
-                })
-        
         supabase_client.table('analyses').update({
             'status': 'completed',
             'completed_at': datetime.now().isoformat(),
             'total_comparisons': total,
             'matches_above_threshold': len(matches),
-            'total_files': 1
+            'total_files': 1,
+            'avg_similarity': round(sum(m['similarity'] for m in matches) / len(matches), 2) if matches else 0
         }).eq('id', analysis_id).execute()
         
         await send_progress(ws_id, {
@@ -1503,9 +1413,6 @@ async def analyze_single_file(
             'analysis_id': analysis_id,
             'matches': len(matches)
         })
-        
-        if temp_path.exists():
-            temp_path.unlink()
         
         return {"success": True, "analysis_id": analysis_id, "matches": len(matches), "total_comparisons": total}
         
@@ -1522,20 +1429,349 @@ async def analyze_single_file(
         print(f"Error: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-
+        
 # ─────────────────────────────────────────────────────────────────────────────
-# ANALYSES - AVEC SUPPRESSION
+# ANALYSES — RÉSULTATS TABLEAU INTERACTIF + EXPORT PDF À LA DEMANDE
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/api/analyses/{analysis_id}/reports")
 async def get_analysis_reports(analysis_id: str):
+    """
+    Récupère les rapports pour le tableau interactif.
+    CORRECTION: les champs file_a_name et file_b_name sont stockés directement
+    dans la table similarity_reports pour éviter tout problème de jointure Supabase.
+    La jointure file_a/file_b est fournie en supplément pour la compatibilité.
+    """
     try:
         result = supabase_client.table('similarity_reports').select(
-            '*, file_a:files!file_a_id(*), file_b:files!file_b_id(*)'
-        ).eq('analysis_id', analysis_id).execute()
-        return {"success": True, "data": result.data}
+            '*, file_a:files!file_a_id(id,filename,word_count,language,file_type), '
+            'file_b:files!file_b_id(id,filename,word_count,language,file_type)'
+        ).eq('analysis_id', analysis_id).order('similarity_percentage', desc=True).execute()
+
+        # Garantir que file_a_name et file_b_name sont toujours présents
+        # en fusionnant la jointure avec les champs directs
+        enriched = []
+        for r in (result.data or []):
+            # file_a_name : jointure en priorité, sinon champ direct, sinon '—'
+            r['file_a_name'] = (
+                (r.get('file_a') or {}).get('filename')
+                or r.get('file_a_name')
+                or '—'
+            )
+            r['file_b_name'] = (
+                (r.get('file_b') or {}).get('filename')
+                or r.get('file_b_name')
+                or '—'
+            )
+            enriched.append(r)
+
+        return {"success": True, "data": enriched}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/analyses/{analysis_id}/detail/{report_id}")
+async def get_report_detail(analysis_id: str, report_id: str):
+    """
+    Retourne les deux textes colorés pour le modal de détail.
+    Construit la colorisation Rouge/Orange/Jaune côté backend.
+    """
+    try:
+        report = supabase_client.table('similarity_reports').select(
+            '*, file_a:files!file_a_id(*), file_b:files!file_b_id(*)'
+        ).eq('id', report_id).execute()
+
+        if not report.data:
+            raise HTTPException(404, "Rapport non trouvé")
+
+        r = report.data[0]
+        segments = r.get('segments', {})
+        if isinstance(segments, str):
+            try: segments = json.loads(segments)
+            except: segments = {'exact': [], 'moderate': [], 'weak': []}
+
+        text_a = r['file_a']['content_text'] if r.get('file_a') else ''
+        text_b = r['file_b']['content_text'] if r.get('file_b') else ''
+
+        def build_colored_text(text: str, segs: dict, is_b: bool = False) -> list:
+            """
+            Retourne une liste de segments avec leur couleur pour affichage frontend.
+            Format: [{'text': '...', 'color': 'red|orange|yellow|normal'}]
+            """
+            if not text:
+                return [{'text': '', 'color': 'normal'}]
+            
+            text = text[:5000]  # Limiter pour performance
+            start_key = 'text_b_start' if is_b else 'text_a_start'
+            end_key   = 'text_b_end'   if is_b else 'text_a_end'
+            
+            annotations = []
+            for seg in segs.get('exact', []):
+                s, e = seg.get(start_key, 0), min(seg.get(end_key, 0), 5000)
+                if s < 5000 and e > s:
+                    annotations.append((s, e, 'red', seg.get('id', 0)))
+            for seg in segs.get('moderate', []):
+                s, e = seg.get(start_key, 0), min(seg.get(end_key, 0), 5000)
+                if s < 5000 and e > s:
+                    annotations.append((s, e, 'orange', seg.get('id', 0)))
+            for seg in segs.get('weak', []):
+                s, e = seg.get(start_key, 0), min(seg.get(end_key, 0), 5000)
+                if s < 5000 and e > s:
+                    annotations.append((s, e, 'yellow', seg.get('id', 0)))
+
+            if not annotations:
+                return [{'text': text, 'color': 'normal', 'num': 0}]
+
+            annotations.sort(key=lambda x: x[0])
+            result = []
+            cursor = 0
+            for s, e, color, num in annotations:
+                if s > cursor:
+                    result.append({'text': text[cursor:s], 'color': 'normal', 'num': 0})
+                result.append({'text': text[s:e], 'color': color, 'num': num})
+                cursor = max(cursor, e)
+            if cursor < len(text):
+                result.append({'text': text[cursor:], 'color': 'normal', 'num': 0})
+            return result
+
+        return {
+            "success": True,
+            "data": {
+                "report_id":          r['id'],
+                "similarity":         r['similarity_percentage'],
+                "similarity_type":    r.get('similarity_type', ''),
+                "exact_matches":      r.get('exact_matches', 0),
+                "moderate_matches":   r.get('moderate_matches', 0),
+                "weak_matches":       r.get('weak_matches', 0),
+                "file_a_name":        r['file_a']['filename'] if r.get('file_a') else '—',
+                "file_b_name":        r['file_b']['filename'] if r.get('file_b') else '—',
+                "file_a_words":       r['file_a']['word_count'] if r.get('file_a') else 0,
+                "file_b_words":       r['file_b']['word_count'] if r.get('file_b') else 0,
+                "file_a_language":    r['file_a']['language'] if r.get('file_a') else '—',
+                "file_b_language":    r['file_b']['language'] if r.get('file_b') else '—',
+                "text_a_segments":    build_colored_text(text_a, segments, is_b=False),
+                "text_b_segments":    build_colored_text(text_b, segments, is_b=True),
+            }
+        }
+    except HTTPException: raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+@app.post("/api/analyses/{analysis_id}/export-pdf")
+async def export_analysis_pdf(analysis_id: str):
+    """
+    Génère UN SEUL PDF récapitulatif de toute l'analyse à la demande.
+    Structure: En-tête professionnel + Tableau récapitulatif (sans textes côte à côte).
+    """
+    try:
+        # Récupérer l'analyse
+        analysis = supabase_client.table('analyses').select('*').eq('id', analysis_id).execute()
+        if not analysis.data:
+            raise HTTPException(404, "Analyse non trouvée")
+        an = analysis.data[0]
+
+        # Récupérer tous les rapports
+        reports = supabase_client.table('similarity_reports').select(
+            '*, file_a:files!file_a_id(*), file_b:files!file_b_id(*)'
+        ).eq('analysis_id', analysis_id).order('similarity_percentage', desc=True).execute()
+
+        if not reports.data:
+            raise HTTPException(404, "Aucun résultat pour cette analyse")
+
+        # Récupérer enseignant et établissement
+        teacher = supabase_client.table('teachers').select('*').eq('id', an['teacher_id']).execute()
+        establishment = None
+        if an.get('establishment_id'):
+            est = supabase_client.table('establishments').select('*').eq('id', an['establishment_id']).execute()
+            if est.data:
+                establishment = est.data[0]
+
+        teacher_name = teacher.data[0]['name'] if teacher.data else ''
+        est_name     = establishment['name'] if establishment else ''
+        threshold    = an.get('similarity_threshold', 15)
+        matches      = reports.data
+
+        # Statistiques globales
+        avg_sim = round(sum(r['similarity_percentage'] for r in matches) / len(matches), 2) if matches else 0
+        max_sim = max((r['similarity_percentage'] for r in matches), default=0)
+
+        # Génération PDF
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.units import cm
+        from reportlab.lib.colors import HexColor, white, black
+        from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
+            Paragraph, Spacer, PageBreak)
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+
+        output_path = REPORTS_DIR / f"recap_{analysis_id}.pdf"
+        doc = SimpleDocTemplate(str(output_path), pagesize=A4,
+            rightMargin=1.5*cm, leftMargin=1.5*cm,
+            topMargin=1*cm, bottomMargin=1*cm)
+
+        story = []
+        styles = getSampleStyleSheet()
+
+        def PS(name, **kw):
+            return ParagraphStyle(name, parent=styles['Normal'], **kw)
+
+        # Couleur selon taux max
+        if max_sim >= 70:   mc, ml = '#C0392B', 'PLAGIAT PROBABLE DÉTECTÉ'
+        elif max_sim >= 40: mc, ml = '#CC6600', 'SIMILARITÉ ÉLEVÉE DÉTECTÉE'
+        elif max_sim >= 15: mc, ml = '#CC9900', 'SIMILARITÉ MODÉRÉE DÉTECTÉE'
+        else:               mc, ml = '#1E8449', 'SIMILARITÉ FAIBLE'
+
+        # ── EN-TÊTE ─────────────────────────────────────────────────────
+        gauche = Paragraph(
+            f"<font size='8' color='#555'>Date :</font><br/>"
+            f"<b><font size='8'>{datetime.now().strftime('%Y-%m-%d %H:%M')}</font></b><br/>"
+            f"<font size='8' color='#555'>Analyse :</font><br/>"
+            f"<b><font size='8'>{analysis_id[:12]}</font></b><br/><br/>"
+            f"<font size='24' color='{mc}'><b>{max_sim}%</b></font><br/>"
+            f"<font size='9' color='{mc}'><b>{ml}</b></font>",
+            PS('lft', fontSize=8, alignment=TA_LEFT))
+
+        centre = Paragraph(
+            f"<font size='20' color='#FF3D71'><b>PlaGiFY</b></font><br/>"
+            f"<font size='9' color='#555'>Rapport d'Analyse Anti-Plagiat</font><br/>"
+            + (f"<br/><font size='9' color='#333'><b>{est_name}</b></font>" if est_name else ''),
+            PS('ctr', fontSize=9, alignment=TA_CENTER))
+
+        droite = Paragraph(
+            f"<font size='8' color='#555'>Enseignant :</font><br/>"
+            f"<b><font size='10'>{teacher_name}</font></b><br/>"
+            f"<font size='8' color='#555'>Seuil défini :</font><br/>"
+            f"<b><font size='10'>{threshold}%</font></b>",
+            PS('rtg', fontSize=8, alignment=TA_RIGHT))
+
+        ht = Table([[gauche, centre, droite]], colWidths=[5.5*cm, 7*cm, 5.5*cm])
+        ht.setStyle(TableStyle([
+            ('BOX', (0,0),(-1,-1), 2, HexColor('#FF3D71')),
+            ('LINEAFTER', (0,0),(0,-1), 1, HexColor('#FF3D71')),
+            ('LINEBEFORE', (2,0),(2,-1), 1, HexColor('#FF3D71')),
+            ('BACKGROUND', (1,0),(1,-1), HexColor('#FFF5F8')),
+            ('VALIGN', (0,0),(-1,-1), 'TOP'),
+            ('TOPPADDING', (0,0),(-1,-1), 8),
+            ('BOTTOMPADDING', (0,0),(-1,-1), 8),
+            ('LEFTPADDING', (0,0),(-1,-1), 8),
+            ('RIGHTPADDING', (0,0),(-1,-1), 8),
+        ]))
+        story += [ht, Spacer(1, 0.4*cm)]
+
+        # ── STATISTIQUES GLOBALES ────────────────────────────────────────
+        story.append(Paragraph("Résumé statistique global", PS('h2', fontSize=10,
+            fontName='Helvetica-Bold', spaceBefore=4, spaceAfter=4)))
+
+        def Pc(t, sz=9, bold=False, color=None, align=TA_CENTER):
+            c = f' color="{color}"' if color else ''
+            b = '<b>' if bold else ''
+            be = '</b>' if bold else ''
+            return Paragraph(f'{b}<font size="{sz}"{c}>{t}</font>{be}',
+                             PS('x', alignment=align))
+
+        st = Table([
+            [Pc('Fichiers comparés', bold=True, color='#FFF'),
+             Pc(str(an.get('total_comparisons', len(matches))), sz=15),
+             Pc('Matches > seuil', bold=True, color='#FFF'),
+             Pc(str(len(matches)), sz=15),
+             Pc('Moy. similarité', bold=True, color='#FFF'),
+             Pc(f'{avg_sim}%', sz=15)],
+        ], colWidths=[3.5*cm, 2.5*cm, 3.5*cm, 2.5*cm, 3.5*cm, 2.5*cm])
+        st.setStyle(TableStyle([
+            ('BACKGROUND', (0,0),(0,-1), HexColor('#FF3D71')),
+            ('BACKGROUND', (2,0),(2,-1), HexColor('#FF3D71')),
+            ('BACKGROUND', (4,0),(4,-1), HexColor('#FF3D71')),
+            ('BACKGROUND', (1,0),(1,-1), HexColor('#FFF5F8')),
+            ('BACKGROUND', (3,0),(3,-1), HexColor('#FFF5F8')),
+            ('BACKGROUND', (5,0),(5,-1), HexColor('#FFF5F8')),
+            ('GRID', (0,0),(-1,-1), 0.5, HexColor('#DDD')),
+            ('ALIGN', (0,0),(-1,-1), 'CENTER'),
+            ('VALIGN', (0,0),(-1,-1), 'MIDDLE'),
+            ('TOPPADDING', (0,0),(-1,-1), 7),
+            ('BOTTOMPADDING', (0,0),(-1,-1), 7),
+        ]))
+        story += [st, Spacer(1, 0.4*cm)]
+
+        # ── TABLEAU RÉCAPITULATIF ────────────────────────────────────────
+        story.append(Paragraph(
+            f"Tableau récapitulatif des correspondances ({len(matches)} résultat(s) au-dessus du seuil {threshold}%)",
+            PS('h2', fontSize=10, fontName='Helvetica-Bold', spaceBefore=4, spaceAfter=4)))
+
+        # En-têtes du tableau
+        table_data = [[
+            Paragraph('<font color="#FFF"><b>Fichier analysé / A</b></font>',
+                      PS('th', alignment=TA_CENTER, fontSize=8)),
+            Paragraph('<font color="#FFF"><b>Fichier comparé / B</b></font>',
+                      PS('th', alignment=TA_CENTER, fontSize=8)),
+            Paragraph('<font color="#FFF"><b>Similarité</b></font>',
+                      PS('th', alignment=TA_CENTER, fontSize=8)),
+            Paragraph('<font color="#FFF"><b>Type</b></font>',
+                      PS('th', alignment=TA_CENTER, fontSize=8)),
+            Paragraph('<font color="#FFF"><b>Verdict</b></font>',
+                      PS('th', alignment=TA_CENTER, fontSize=8)),
+        ]]
+
+        row_colors = []
+        for i, r in enumerate(matches):
+            sim = r['similarity_percentage']
+            if sim >= 70:   rc, rv = '#C0392B', 'PLAGIAT PROBABLE'
+            elif sim >= 40: rc, rv = '#CC6600', 'ÉLEVÉE'
+            elif sim >= 15: rc, rv = '#CC9900', 'MODÉRÉE'
+            else:           rc, rv = '#1E8449', 'FAIBLE'
+
+            fa_name = r['file_a']['filename'] if r.get('file_a') else '—'
+            fb_name = r['file_b']['filename'] if r.get('file_b') else '—'
+
+            table_data.append([
+                Paragraph(fa_name[:40], PS(f'ra{i}', fontSize=8, wordWrap='CJK')),
+                Paragraph(fb_name[:40], PS(f'rb{i}', fontSize=8, wordWrap='CJK')),
+                Paragraph(f'<font color="{rc}" size="11"><b>{sim}%</b></font>',
+                          PS(f'rp{i}', alignment=TA_CENTER)),
+                Paragraph(r.get('similarity_type', '—')[:25],
+                          PS(f'rt{i}', fontSize=7)),
+                Paragraph(f'<font color="{rc}"><b>{rv}</b></font>',
+                          PS(f'rv{i}', alignment=TA_CENTER, fontSize=8)),
+            ])
+            row_colors.append(HexColor('#FFF') if i % 2 == 0 else HexColor('#F9F9F9'))
+
+        main_table = Table(table_data, colWidths=[5*cm, 5*cm, 2.5*cm, 2.8*cm, 2.7*cm])
+        ts = [
+            ('BACKGROUND', (0,0),(-1,0), HexColor('#667EEA')),
+            ('GRID', (0,0),(-1,-1), 0.5, HexColor('#CCC')),
+            ('ALIGN', (0,0),(-1,-1), 'LEFT'),
+            ('VALIGN', (0,0),(-1,-1), 'MIDDLE'),
+            ('TOPPADDING', (0,0),(-1,-1), 5),
+            ('BOTTOMPADDING', (0,0),(-1,-1), 5),
+            ('LEFTPADDING', (0,0),(-1,-1), 6),
+        ]
+        for i, color in enumerate(row_colors):
+            ts.append(('BACKGROUND', (0, i+1), (-1, i+1), color))
+        main_table.setStyle(TableStyle(ts))
+        story += [main_table, Spacer(1, 0.6*cm)]
+
+        # ── FOOTER ──────────────────────────────────────────────────────
+        ft = Table([
+            ["Généré le",         datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
+            ["Signature",         hashlib.sha256(f"{analysis_id}{datetime.now().date()}".encode()).hexdigest()[:32]],
+            ["Version algorithme","PlaGiFY v4.0 — Détection anti-plagiat professionnelle"],
+        ], colWidths=[4*cm, 14*cm])
+        ft.setStyle(TableStyle([
+            ('FONTNAME', (0,0),(0,-1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0,0),(-1,-1), 8),
+            ('GRID', (0,0),(-1,-1), 0.5, HexColor('#CCC')),
+            ('BACKGROUND', (0,0),(0,-1), HexColor('#F0F0F0')),
+        ]))
+        story.append(ft)
+
+        doc.build(story)
+
+        return FileResponse(str(output_path), media_type='application/pdf',
+            filename=f"PlaGiFY_Analyse_{analysis_id[:8]}.pdf")
+
+    except HTTPException: raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
 
 @app.get("/api/analyses/{teacher_id}")
 async def get_analyses(teacher_id: str):
@@ -1547,17 +1783,11 @@ async def get_analyses(teacher_id: str):
 
 @app.delete("/api/analyses/{analysis_id}")
 async def delete_analysis(analysis_id: str):
-    """✅ NOUVEAU: Supprimer une analyse de l'historique"""
+    """Supprimer une analyse de l'historique"""
     try:
-        # Supprimer les rapports
         supabase_client.table('similarity_reports').delete().eq('analysis_id', analysis_id).execute()
-        
-        # Supprimer l'analyse
         supabase_client.table('analyses').delete().eq('id', analysis_id).execute()
-        
-        # Supprimer les fichiers du storage
         try:
-            # Liste tous les fichiers du dossier
             files_list = get_bucket('plagify-reports').list(f"reports/{analysis_id}/")
             for file_obj in files_list:
                 try:
@@ -1566,7 +1796,6 @@ async def delete_analysis(analysis_id: str):
                     pass
         except Exception as e:
             print(f"Storage cleanup error: {e}")
-        
         return {"success": True, "message": "Analyse supprimée"}
     except Exception as e:
         print(f"Delete error: {e}")
@@ -1574,52 +1803,343 @@ async def delete_analysis(analysis_id: str):
 
 @app.get("/api/analyses/{analysis_id}/download-all")
 async def download_analysis_package(analysis_id: str):
-    """✅ NOUVEAU: Télécharger toute l'analyse en ZIP organisé"""
-    try:
-        # Récupérer les rapports
-        reports = supabase_client.table('similarity_reports').select('*').eq('analysis_id', analysis_id).execute()
-        
-        if not reports.data:
-            raise HTTPException(404, "Aucun rapport trouvé")
-        
-        # Créer ZIP
-        zip_buffer = BytesIO()
-        
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            for idx, report in enumerate(reports.data, 1):
-                folder_name = f"dossier_{idx}"
-                
-                # Télécharger le rapport PDF
-                if report.get('report_pdf_url'):
-                    pdf_path = report['report_pdf_url'].split('/storage/v1/object/public/plagify-reports/')[-1]
-                    try:
-                        pdf_bytes = get_bucket('plagify-reports').download(pdf_path)
-                        zip_file.writestr(f"{folder_name}/rapport_similarite.pdf", pdf_bytes)
-                    except Exception as e:
-                        print(f"PDF download error: {e}")
-                
-                # Télécharger les fichiers sources (s'ils existent dans le storage)
-                try:
-                    source_files = get_bucket('plagify-reports').list(f"reports/{analysis_id}/dossier_{idx}/")
-                    for source_file in source_files:
-                        if not source_file['name'].endswith('.pdf'):
-                            file_bytes = get_bucket('plagify-reports').download(f"reports/{analysis_id}/dossier_{idx}/{source_file['name']}")
-                            zip_file.writestr(f"{folder_name}/{source_file['name']}", file_bytes)
-                except Exception as e:
-                    print(f"Source files error: {e}")
-        
-        zip_buffer.seek(0)
-        
-        return StreamingResponse(
-            zip_buffer,
-            media_type="application/zip",
-            headers={"Content-Disposition": f"attachment; filename=\"analysis_{analysis_id}.zip\""}
-        )
-        
-    except Exception as e:
-        print(f"Download package error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Télécharger toute l'analyse en ZIP — redirige vers export-pdf"""
+    return await export_analysis_pdf(analysis_id)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DÉTECTION IA
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_ai_content(text: str) -> dict:
+    """
+    Détecte les passages probablement générés par IA.
+    Basé sur des indicateurs linguistiques mesurables et vérifiables:
+    1. Longueur moyenne des phrases (IA = phrases longues et uniformes)
+    2. Diversité lexicale (TTR - Type Token Ratio) — IA = vocabulaire riche mais répétitif dans les structures
+    3. Densité de connecteurs logiques (IA surcharge les connecteurs)
+    4. Uniformité du style (variance de longueur des phrases — IA = très faible variance)
+    5. Densité de termes abstraits et génériques
+    6. Structure passive vs active
+    """
+    import re
+    import math
+
+    if not text or len(text.strip()) < 50:
+        return {'global_score': 0, 'segments': [], 'details': {}}
+
+    # Découper en phrases
+    sentences = re.split(r'[.!?]+', text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+
+    if not sentences:
+        return {'global_score': 0, 'segments': [], 'details': {}}
+
+    # ── Indicateur 1 : Longueur moyenne des phrases ──────────────────
+    sent_lengths = [len(s.split()) for s in sentences]
+    avg_len = sum(sent_lengths) / len(sent_lengths) if sent_lengths else 0
+    # IA typique: 20-35 mots/phrase. Humain typique: 10-20.
+    len_score = min(100, max(0, (avg_len - 15) * 4)) if avg_len > 15 else 0
+
+    # ── Indicateur 2 : Uniformité (faible variance) ──────────────────
+    if len(sent_lengths) > 1:
+        variance = sum((x - avg_len) ** 2 for x in sent_lengths) / len(sent_lengths)
+        std_dev = math.sqrt(variance)
+        # IA = faible écart-type (< 8). Humain = écart-type plus élevé (> 12)
+        uniformity_score = min(100, max(0, (10 - std_dev) * 8)) if std_dev < 10 else 0
+    else:
+        uniformity_score = 50
+
+    # ── Indicateur 3 : Densité connecteurs logiques ──────────────────
+    connectors = [
+        'en outre', 'par ailleurs', 'de plus', 'ainsi', 'cependant',
+        'néanmoins', 'toutefois', 'en effet', 'par conséquent', 'donc',
+        'furthermore', 'moreover', 'however', 'therefore', 'consequently',
+        'additionally', 'in addition', 'nevertheless', 'thus', 'hence',
+        'il convient de', 'il est important de', 'il est essentiel',
+        'dans ce contexte', 'à cet égard', 'en ce sens'
+    ]
+    text_lower = text.lower()
+    connector_count = sum(1 for c in connectors if c in text_lower)
+    words = text.split()
+    word_count = len(words)
+    connector_density = (connector_count / (word_count / 100)) if word_count > 0 else 0
+    connector_score = min(100, connector_density * 15)
+
+    # ── Indicateur 4 : Diversité lexicale (TTR ajusté) ──────────────
+    if word_count > 0:
+        unique_words = len(set(w.lower().strip('.,;:!?()[]"\'') for w in words))
+        ttr = unique_words / word_count
+        # IA: TTR modéré (0.4-0.6) mais structures répétitives
+        # On détecte surtout la répétition de bi-grams
+        bigrams = [f"{words[i].lower()} {words[i+1].lower()}" for i in range(len(words)-1)]
+        unique_bigrams = len(set(bigrams))
+        bigram_ratio = unique_bigrams / len(bigrams) if bigrams else 1
+        structure_score = min(100, max(0, (0.85 - bigram_ratio) * 200))
+    else:
+        structure_score = 0
+
+    # ── Indicateur 5 : Mots génériques IA ───────────────────────────
+    ai_markers = [
+        'il est crucial', 'il est fondamental', 'approche holistique',
+        'paradigme', 'synergies', 'optimiser', 'maximiser', 'dans le cadre de',
+        'mise en oeuvre', 'enjeux', 'problématique', 'thématique',
+        'it is worth noting', 'it is important to note', 'in conclusion',
+        'to summarize', 'in summary', 'comprehensive', 'robust', 'leverage',
+        'utilize', 'facilitate', 'implement', 'demonstrate', 'ensure'
+    ]
+    marker_count = sum(1 for m in ai_markers if m in text_lower)
+    marker_score = min(100, marker_count * 12)
+
+    # ── Score global pondéré ─────────────────────────────────────────
+    global_score = round(
+        len_score * 0.25 +
+        uniformity_score * 0.25 +
+        connector_score * 0.20 +
+        structure_score * 0.15 +
+        marker_score * 0.15
+    , 1)
+
+    # ── Colorisation par segments ────────────────────────────────────
+    colored_segments = []
+    pos = 0
+    for sent in sentences:
+        sent_words = sent.split()
+        if not sent_words:
+            continue
+
+        s_len = len(sent_words)
+        s_lower = sent.lower()
+
+        # Score individuel de cette phrase
+        s_score = 0
+        if s_len > 25: s_score += 40
+        elif s_len > 18: s_score += 20
+
+        if any(c in s_lower for c in connectors[:15]): s_score += 25
+        if any(m in s_lower for m in ai_markers[:10]): s_score += 35
+
+        if s_score >= 60:
+            color = 'red'       # Très probablement IA
+        elif s_score >= 35:
+            color = 'orange'    # Probablement IA
+        elif s_score >= 15:
+            color = 'yellow'    # Possiblement IA
+        else:
+            color = 'normal'    # Probablement humain
+
+        colored_segments.append({
+            'text': sent,
+            'color': color,
+            'score': s_score
+        })
+
+    return {
+        'global_score': global_score,
+        'segments': colored_segments,
+        'details': {
+            'avg_sentence_length': round(avg_len, 1),
+            'uniformity_score': round(uniformity_score, 1),
+            'connector_density': round(connector_score, 1),
+            'structure_score': round(structure_score, 1),
+            'marker_score': round(marker_score, 1),
+            'total_sentences': len(sentences),
+            'total_words': word_count
+        }
+    }
+
+
+@app.post("/api/detect-ai")
+async def detect_ai(
+    teacher_id: str = Form(...),
+    establishment_id: Optional[str] = Form(None),
+    file: UploadFile = File(...)
+):
+    """
+    Analyse un document pour détecter les passages générés par IA.
+    Retourne le score global + segments colorés.
+    """
+    try:
+        safe_filename = sanitize_filename(Path(file.filename).name)
+        temp_path = UPLOAD_DIR / f"ai_detect_{safe_filename}"
+        temp_path.write_bytes(await file.read())
+
+        text, language = extract_text_from_file(temp_path)
+        temp_path.unlink()
+
+        if not text or len(text.strip()) < 50:
+            raise HTTPException(400, "Le fichier est vide ou trop court pour être analysé")
+
+        result = detect_ai_content(text)
+
+        return {
+            "success": True,
+            "filename": safe_filename,
+            "language": language,
+            "global_score": result['global_score'],
+            "segments": result['segments'],
+            "details": result['details'],
+            "verdict": (
+                "Contenu très probablement généré par IA" if result['global_score'] >= 70 else
+                "Contenu probablement généré par IA" if result['global_score'] >= 45 else
+                "Contenu possiblement assisté par IA" if result['global_score'] >= 25 else
+                "Contenu probablement rédigé par un humain"
+            )
+        }
+    except HTTPException: raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/detect-ai/export-pdf")
+async def export_ai_pdf(
+    teacher_id: str = Form(...),
+    establishment_id: Optional[str] = Form(None),
+    filename: str = Form(...),
+    global_score: float = Form(...),
+    verdict: str = Form(...),
+    segments_json: str = Form(...),
+    details_json: str = Form(...)
+):
+    """
+    Génère un PDF simple de rapport de détection IA.
+    Structure: En-tête + Score global (gros) + Texte coloré par segments.
+    """
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.units import cm
+        from reportlab.lib.colors import HexColor, white
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+
+        segments = json.loads(segments_json)
+        details  = json.loads(details_json)
+
+        teacher = supabase_client.table('teachers').select('*').eq('id', teacher_id).execute()
+        teacher_name = teacher.data[0]['name'] if teacher.data else ''
+
+        est_name = ''
+        if establishment_id:
+            est = supabase_client.table('establishments').select('*').eq('id', establishment_id).execute()
+            if est.data:
+                est_name = est.data[0]['name']
+
+        output_path = REPORTS_DIR / f"ai_report_{hashlib.md5(filename.encode()).hexdigest()[:8]}.pdf"
+        doc = SimpleDocTemplate(str(output_path), pagesize=A4,
+            rightMargin=1.5*cm, leftMargin=1.5*cm, topMargin=1*cm, bottomMargin=1*cm)
+        story = []
+        styles = getSampleStyleSheet()
+
+        def PS(name, **kw):
+            return ParagraphStyle(name, parent=styles['Normal'], **kw)
+
+        if global_score >= 70:   sc = '#C0392B'
+        elif global_score >= 45: sc = '#CC6600'
+        elif global_score >= 25: sc = '#CC9900'
+        else:                    sc = '#1E8449'
+
+        # ── EN-TÊTE ─────────────────────────────────────────────────────
+        gauche = Paragraph(
+            f"<font size='8' color='#555'>Date :</font><br/>"
+            f"<b>{datetime.now().strftime('%Y-%m-%d %H:%M')}</b><br/>"
+            f"<font size='8' color='#555'>Fichier :</font><br/>"
+            f"<b>{filename}</b>",
+            PS('lft', fontSize=8, alignment=TA_LEFT))
+        centre = Paragraph(
+            f"<font size='20' color='#FF3D71'><b>PlaGiFY</b></font><br/>"
+            f"<font size='9' color='#555'>Détection de Contenu IA</font><br/>"
+            + (f"<br/><font size='9'><b>{est_name}</b></font>" if est_name else ''),
+            PS('ctr', fontSize=9, alignment=TA_CENTER))
+        droite = Paragraph(
+            f"<font size='8' color='#555'>Enseignant :</font><br/>"
+            f"<b>{teacher_name}</b><br/><br/>"
+            f"<font size='26' color='{sc}'><b>{global_score}%</b></font><br/>"
+            f"<font size='8' color='{sc}'><b>IA détectée</b></font>",
+            PS('rtg', fontSize=8, alignment=TA_RIGHT))
+
+        ht = Table([[gauche, centre, droite]], colWidths=[5.5*cm, 7*cm, 5.5*cm])
+        ht.setStyle(TableStyle([
+            ('BOX', (0,0),(-1,-1), 2, HexColor('#FF3D71')),
+            ('BACKGROUND', (1,0),(1,-1), HexColor('#FFF5F8')),
+            ('VALIGN', (0,0),(-1,-1), 'TOP'),
+            ('TOPPADDING', (0,0),(-1,-1), 8),
+            ('BOTTOMPADDING', (0,0),(-1,-1), 8),
+            ('LEFTPADDING', (0,0),(-1,-1), 8),
+            ('RIGHTPADDING', (0,0),(-1,-1), 8),
+        ]))
+        story += [ht, Spacer(1, 0.4*cm)]
+
+        # ── VERDICT ─────────────────────────────────────────────────────
+        story.append(Paragraph(
+            f'<font color="{sc}" size="11"><b>VERDICT : {verdict}</b></font>',
+            PS('vd', fontSize=11, alignment=TA_CENTER)))
+        story.append(Spacer(1, 0.3*cm))
+
+        # ── MÉTRIQUES ────────────────────────────────────────────────────
+        met = Table([
+            ['Longueur moy. phrases', f"{details.get('avg_sentence_length', 0)} mots",
+             'Uniformité style', f"{details.get('uniformity_score', 0)}%"],
+            ['Densité connecteurs', f"{details.get('connector_density', 0)}%",
+             'Marqueurs IA', f"{details.get('marker_score', 0)}%"],
+            ['Phrases analysées', str(details.get('total_sentences', 0)),
+             'Mots totaux', str(details.get('total_words', 0))],
+        ], colWidths=[4.5*cm, 2.5*cm, 4.5*cm, 2.5*cm])
+        met.setStyle(TableStyle([
+            ('FONTNAME', (0,0),(0,-1), 'Helvetica-Bold'),
+            ('FONTNAME', (2,0),(2,-1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0,0),(-1,-1), 8),
+            ('GRID', (0,0),(-1,-1), 0.5, HexColor('#CCC')),
+            ('BACKGROUND', (0,0),(0,-1), HexColor('#F0F0F0')),
+            ('BACKGROUND', (2,0),(2,-1), HexColor('#F0F0F0')),
+            ('ALIGN', (1,0),(1,-1), 'CENTER'),
+            ('ALIGN', (3,0),(3,-1), 'CENTER'),
+            ('ROWBACKGROUNDS', (0,0),(-1,-1), [HexColor('#FFF'), HexColor('#F9F9FF')]),
+        ]))
+        story += [met, Spacer(1, 0.4*cm)]
+
+        # ── LÉGENDE ──────────────────────────────────────────────────────
+        story.append(Paragraph(
+            '<font size="8" color="#C0392B">■ Rouge</font> = Très probablement IA (≥60%)   '
+            '<font size="8" color="#CC6600">■ Orange</font> = Probablement IA (35-60%)   '
+            '<font size="8" color="#CC9900">■ Jaune</font> = Possiblement IA (15-35%)   '
+            '<font size="8" color="#555">■ Blanc</font> = Probablement humain',
+            PS('leg', fontSize=8, spaceAfter=6)))
+
+        # ── TEXTE COLORÉ ─────────────────────────────────────────────────
+        story.append(Paragraph("Analyse phrase par phrase", PS('h2', fontSize=10,
+            fontName='Helvetica-Bold', spaceAfter=4)))
+
+        color_map = {
+            'red':    '#C0392B',
+            'orange': '#CC6600',
+            'yellow': '#CC9900',
+            'normal': '#333333'
+        }
+        S_TXT = PS('txt', fontSize=8, leading=11, fontName='Helvetica', wordWrap='CJK')
+
+        for seg in segments:
+            color = color_map.get(seg.get('color', 'normal'), '#333333')
+            text_safe = seg['text'].replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+            story.append(Paragraph(
+                f'<font color="{color}">{text_safe}</font>', S_TXT))
+
+        # ── FOOTER ───────────────────────────────────────────────────────
+        story.append(Spacer(1, 0.5*cm))
+        story.append(Paragraph(
+            f"Généré par PlaGiFY v4.0 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            PS('ft', fontSize=7, alignment=TA_CENTER,
+               textColor=HexColor('#999'))))
+
+        doc.build(story)
+
+        return FileResponse(str(output_path), media_type='application/pdf',
+            filename=f"PlaGiFY_IA_{filename[:20]}.pdf")
+
+    except HTTPException: raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
 # ─────────────────────────────────────────────────────────────────────────────
 # STATISTICS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1754,6 +2274,9 @@ async def process_drive_file(
                     'analysis_id':           analysis_id,
                     'file_a_id':             new_file['id'],
                     'file_b_id':             db_file['id'],
+                    # CORRECTION CRITIQUE: stocker les noms directement
+                    'file_a_name':           safe_name,
+                    'file_b_name':           db_file['filename'],
                     'similarity_percentage': sim,
                     'similarity_type':       'Google Drive - Surveillance automatique',
                     'exact_matches':         det['exact_count'],
@@ -1762,76 +2285,11 @@ async def process_drive_file(
                     'segments':              json.dumps(det['segments'])
                 }).execute()
 
-                # Générer rapport PDF
-                report_id  = rr.data[0]['id']
-                rfn        = f"report_{report_id}.pdf"
-                rp         = REPORTS_DIR / rfn
-
-                # Récupérer infos enseignant et établissement
-                teacher    = supabase_client.table('teachers').select('*').eq(
-                    'id', teacher_id).execute()
-                est_id     = monitor_data.get('establishment_id')
-                est_data   = supabase_client.table('establishments').select('*').eq(
-                    'id', est_id).execute() if est_id else None
-
-                rd_ = {
-                    'report_id':             report_id,
-                    'date':                  datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'teacher_name':          teacher.data[0]['name'] if teacher.data else '',
-                    'establishment_name':    est_data.data[0]['name'] if est_data and est_data.data else '',
-                    'global_similarity':     sim,
-                    'total_comparisons':     len(other_files.data),
-                    'avg_similarity':        sim,
-                    'matches_count':         1,
-                    'threshold':             threshold,
-                    'file_a_name':           safe_name,
-                    'file_b_name':           db_file['filename'],
-                    'file_a_size':           file_size,
-                    'file_b_size':           db_file.get('file_size', 0),
-                    'file_a_words':          len(text.split()),
-                    'file_b_words':          db_file.get('word_count', 0),
-                    'file_a_language':       language,
-                    'file_b_language':       db_file.get('language', 'inconnu'),
-                    'exact_matches':         det['exact_count'],
-                    'moderate_matches':      det['moderate_count'],
-                    'weak_matches':          det['weak_count'],
-                    'similarity_type':       'Google Drive - Surveillance automatique',
-                    'text_a':                text,
-                    'text_b':                db_file.get('content_text', ''),
-                    'segments':              det['segments'],
-                    'similarity_no_quotes':  sim,
-                    'structural_similarity': round(sim * 0.9, 2),
-                    'syntactic_similarity':  round(sim * 0.85, 2),
-                    'signature':             hashlib.sha256(
-                        f"{report_id}{datetime.now().isoformat()}".encode()
-                    ).hexdigest()[:32]
-                }
-
-                generate_pdf_report_professional(rd_, rp)
-
-                pdf_url = None
-                try:
-                    with open(rp, 'rb') as pf:
-                        get_bucket('plagify-reports').upload(
-                            f"reports/{analysis_id}/{rfn}",
-                            pf.read(),
-                            {'content-type': 'application/pdf', 'upsert': 'true'}
-                        )
-                    pdf_url = get_bucket('plagify-reports').get_public_url(
-                        f"reports/{analysis_id}/{rfn}"
-                    )
-                except Exception as pe:
-                    print(f"[Drive] Upload PDF non critique: {pe}")
-                    pdf_url = f"{os.getenv('API_BASE_URL', 'http://localhost:8000')}/reports/{rfn}"
-
-                supabase_client.table('similarity_reports').update({
-                    'report_pdf_url': pdf_url
-                }).eq('id', report_id).execute()
-
+                # Pas de PDF individuel — tableau interactif uniquement
+                # Le PDF récapitulatif est généré à la demande via /api/analyses/{id}/export-pdf
                 matches.append({
                     'db_file':    db_file['filename'],
                     'similarity': sim,
-                    'pdf_url':    pdf_url
                 })
 
         # ── Mettre à jour les stats de l'analyse ───────────────────────────
@@ -1877,17 +2335,29 @@ async def monitor_drive_folder(monitor_id: str):
     teacher_id   = monitor_data['teacher_id']
 
     # Créer une analyse de type google_drive pour regrouper tous les rapports
-    analysis = supabase_client.table('analyses').insert({
-        'teacher_id':           teacher_id,
-        'establishment_id':     monitor_data.get('establishment_id'),
-        'analysis_type':        'google_drive',
-        'source_name':          f"Google Drive — {monitor_data['drive_link'][:60]}",
-        'google_drive_link':    monitor_data['drive_link'],
-        'similarity_threshold': monitor_data.get('similarity_threshold', 15.0),
-        'status':               'processing',
-        'total_files':          0
-    }).execute()
-    analysis_id = analysis.data[0]['id']
+    # Vérifier si une analyse google_drive existe déjà pour ce teacher + monitor
+    # (évite de créer une nouvelle analyse à chaque redémarrage du serveur)
+    existing_analysis = supabase_client.table('analyses').select('id').eq(
+        'teacher_id', teacher_id
+    ).eq('analysis_type', 'google_drive').eq(
+        'source_name', f"Google Drive — {monitor_data['drive_link'][:60]}"
+    ).eq('status', 'processing').execute()
+
+    if existing_analysis.data:
+        analysis_id = existing_analysis.data[0]['id']
+        print(f"[Drive] Reprise de l'analyse existante: {analysis_id[:8]}")
+    else:
+        analysis = supabase_client.table('analyses').insert({
+            'teacher_id':           teacher_id,
+            'establishment_id':     monitor_data.get('establishment_id'),
+            'analysis_type':        'google_drive',
+            'source_name':          f"Google Drive — {monitor_data['drive_link'][:60]}",
+            'similarity_threshold': monitor_data.get('similarity_threshold', 15.0),
+            'status':               'processing',
+            'total_files':          0
+        }).execute()
+        analysis_id = analysis.data[0]['id']
+        print(f"[Drive] Nouvelle analyse créée: {analysis_id[:8]}")
 
     # Ensemble des IDs Drive déjà vus pour ne pas retraiter
     already_seen: set = set()
@@ -2227,29 +2697,34 @@ async def delete_drive_monitor(monitor_id: str):
 
 @app.get("/api/google-drive/monitors/{monitor_id}/reports")
 async def get_monitor_reports(monitor_id: str):
-    """Récupérer tous les rapports générés par une surveillance"""
+    """Récupérer tous les rapports générés par une surveillance spécifique"""
     try:
-        # Trouver l'analyse liée à ce monitor
         monitor = supabase_client.table('google_drive_monitors').select('*').eq(
             'id', monitor_id).execute()
         if not monitor.data:
             raise HTTPException(404, "Monitor non trouvé")
 
-        teacher_id = monitor.data[0]['teacher_id']
+        mon = monitor.data[0]
+        teacher_id = mon['teacher_id']
+        source_name = f"Google Drive — {mon['drive_link'][:60]}"
 
-        # Récupérer les analyses google_drive de cet enseignant
-        analyses = supabase_client.table('analyses').select('*').eq(
+        # Récupérer UNIQUEMENT les analyses liées à CE monitor (par source_name)
+        analyses = supabase_client.table('analyses').select('id,status,started_at,matches_above_threshold').eq(
             'teacher_id', teacher_id
-        ).eq('analysis_type', 'google_drive').order('started_at', desc=True).execute()
+        ).eq('analysis_type', 'google_drive').eq(
+            'source_name', source_name
+        ).order('started_at', desc=True).execute()
 
         all_reports = []
-        for an in analyses.data:
+        analysis_ids = [a['id'] for a in analyses.data]
+
+        for an_id in analysis_ids:
             reports = supabase_client.table('similarity_reports').select(
                 '*, file_a:files!file_a_id(*), file_b:files!file_b_id(*)'
-            ).eq('analysis_id', an['id']).execute()
+            ).eq('analysis_id', an_id).order('similarity_percentage', desc=True).execute()
             all_reports.extend(reports.data)
 
-        return {"success": True, "data": all_reports}
+        return {"success": True, "data": all_reports, "analysis_ids": analysis_ids}
 
     except HTTPException:
         raise
