@@ -24,6 +24,9 @@ from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
 import traceback
 import zipfile
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from io import BytesIO
 import shutil
 
@@ -1054,13 +1057,13 @@ async def analyze_folder(
     establishment_id: Optional[str] = Form(None),
     threshold: float = Form(15.0),
     ws_id: str = Form(...),
-    save_to_database: bool = Form(False),
     files: List[UploadFile] = File(...)
 ):
     """
     Analyse complète de dossier.
-    NE génère PAS de PDF automatiquement.
-    Sauvegarde les résultats en base pour affichage tableau interactif.
+    Les fichiers analysés NE sont PAS insérés en base de données.
+    Seuls les résultats (similarity_reports) sont sauvegardés.
+    L'insertion en BD se fait uniquement via l'onglet Base de données.
     Le PDF est généré à la demande via /api/analyses/{id}/export-pdf
     """
     analysis_id = None
@@ -1120,23 +1123,12 @@ async def analyze_folder(
             except Exception as storage_error:
                 print(f"Storage error: {storage_error}")
             
-            # ── Toujours enregistrer en BD pour avoir un file_id valide ──────
-            # Si save_to_database=False, on marque avec 'folder_analysis::' pour nettoyage ultérieur
-            original_path_marker = file.filename if save_to_database else f"folder_analysis::{analysis_id}::{safe_filename}"
-            
-            file_record = supabase_client.table('files').insert({
-                'teacher_id':    teacher_id,
-                'filename':      safe_filename,
-                'original_path': original_path_marker,
-                'storage_path':  storage_path,
-                'file_type':     ext,
-                'file_size':     file_size,
-                'content_text':  text[:50000],
-                'content_hash':  content_hash,
-                'word_count':    len(text.split()),
-                'language':      language
-            }).execute()
-            file_id = file_record.data[0]['id']
+            # ── Pas d'insertion en BD — stockage en mémoire uniquement ─────
+            # Les fichiers analysés ne sont JAMAIS insérés en BD ici.
+            # L'insertion en BD se fait uniquement via l'onglet Base de données.
+            # On génère un ID temporaire unique pour ce cycle d'analyse.
+            import uuid as _uuid
+            file_id = str(_uuid.uuid4())
             
             file_records.append({
                 'id': file_id,
@@ -1195,10 +1187,8 @@ async def analyze_folder(
                     
                     report = supabase_client.table('similarity_reports').insert({
                         'analysis_id':           analysis_id,
-                        'file_a_id':             file_a['id'],
-                        'file_b_id':             file_b['id'],
-                        # CORRECTION CRITIQUE: stocker les noms directement pour éviter
-                        # tout problème de jointure côté frontend
+                        'file_a_id':             None,
+                        'file_b_id':             None,
                         'file_a_name':           file_a['filename'],
                         'file_b_name':           file_b['filename'],
                         'similarity_percentage': similarity,
@@ -1206,7 +1196,9 @@ async def analyze_folder(
                         'exact_matches':         details['exact_count'],
                         'moderate_matches':      details['moderate_count'],
                         'weak_matches':          details['weak_count'],
-                        'segments':              json.dumps(details['segments'])
+                        'segments':              json.dumps(details['segments']),
+                        'text_a':                file_a['text'][:30000],
+                        'text_b':                file_b['text'][:30000]
                     }).execute()
                     
                     matches.append({
@@ -1262,6 +1254,192 @@ async def analyze_folder(
             except:
                 pass
         print(f"Error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANALYSE FICHIERS DIRECTS — Import depuis l'appareil (≥2 fichiers)
+# Logique identique à analyze_folder mais analysis_type='direct_files'
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/analyze/direct-files")
+async def analyze_direct_files(
+    teacher_id: str = Form(...),
+    establishment_id: Optional[str] = Form(None),
+    threshold: float = Form(15.0),
+    ws_id: str = Form(...),
+    files: List[UploadFile] = File(...)
+):
+    """
+    Analyse directe de fichiers importés depuis l'appareil.
+    Les fichiers NE sont PAS insérés en base de données.
+    L'insertion en BD se fait uniquement via l'onglet Base de données.
+    Aucun PDF automatique — tableau interactif + export à la demande.
+    """
+    analysis_id = None
+    try:
+        if len(files) < 2:
+            raise HTTPException(400, "Au moins 2 fichiers requis pour une comparaison")
+
+        analysis = supabase_client.table('analyses').insert({
+            'teacher_id':           teacher_id,
+            'establishment_id':     establishment_id,
+            'analysis_type':        'direct_files',
+            'source_name':          f"Import direct ({len(files)} fichiers)",
+            'similarity_threshold': threshold,
+            'status':               'processing',
+            'total_files':          len(files)
+        }).execute()
+
+        analysis_id = analysis.data[0]['id']
+
+        # ── PHASE 1 : EXTRACTION ──────────────────────────────────────────────
+        await send_progress(ws_id, {
+            'stage': 'extraction', 'progress': 0, 'total': len(files),
+            'message': "Extraction du texte des fichiers..."
+        })
+
+        file_records = []
+        for idx, file in enumerate(files):
+            await send_progress(ws_id, {
+                'stage': 'extraction', 'progress': idx, 'total': len(files),
+                'message': f"Extraction : {file.filename}"
+            })
+
+            safe_filename = sanitize_filename(Path(file.filename).name)
+            ext = Path(safe_filename).suffix.lower()
+
+            if ext not in VALID_EXTENSIONS:
+                continue
+
+            temp_path = UPLOAD_DIR / f"{analysis_id}_direct_{safe_filename}"
+            file_bytes = await file.read()
+            temp_path.write_bytes(file_bytes)
+
+            text, language = extract_text_from_file(temp_path)
+            content_hash  = compute_hash(text)
+            file_size     = temp_path.stat().st_size
+
+            # ── Pas d'insertion en BD — uniquement en mémoire ───────────────
+            # Pas d'upload Storage non plus (fichiers temporaires pour l'analyse)
+            temp_path.unlink(missing_ok=True)
+            import uuid as _uuid
+            file_id = str(_uuid.uuid4())
+
+            file_records.append({
+                'id':         file_id,
+                'text':       text,
+                'filename':   safe_filename,
+                'language':   language,
+                'word_count': len(text.split()),
+                'size':       file_size,
+            })
+
+            await send_progress(ws_id, {
+                'stage': 'extraction', 'progress': idx + 1, 'total': len(files)
+            })
+
+        if len(file_records) < 2:
+            raise HTTPException(400, "Au moins 2 fichiers valides requis (formats supportés)")
+
+        # ── PHASE 2 : COMPARAISON ─────────────────────────────────────────────
+        comparisons_total = len(file_records) * (len(file_records) - 1) // 2
+        comparisons_done  = 0
+        matches = []
+
+        await send_progress(ws_id, {
+            'stage': 'comparison', 'progress': 0, 'total': comparisons_total,
+            'message': f"Comparaison de {len(file_records)} fichiers ({comparisons_total} paire(s))..."
+        })
+
+        for i in range(len(file_records)):
+            for j in range(i + 1, len(file_records)):
+                fa = file_records[i]
+                fb = file_records[j]
+
+                await send_progress(ws_id, {
+                    'stage': 'comparison', 'progress': comparisons_done,
+                    'total': comparisons_total,
+                    'message': f"{fa['filename']} vs {fb['filename']}"
+                })
+
+                similarity, details = calculate_similarity(fa['text'], fb['text'])
+                comparisons_done += 1
+
+                if similarity >= threshold:
+                    lang     = fa['language']
+                    sim_type = (
+                        f"{'Code' if lang in ['Python','Java','C','JavaScript','PHP'] else 'Texte'}"
+                        f" — {'Exact' if similarity > 80 else 'Modéré' if similarity > 50 else 'Partiel'}"
+                    )
+                    supabase_client.table('similarity_reports').insert({
+                        'analysis_id':           analysis_id,
+                        'file_a_id':             None,
+                        'file_b_id':             None,
+                        'file_a_name':           fa['filename'],
+                        'file_b_name':           fb['filename'],
+                        'similarity_percentage': similarity,
+                        'similarity_type':       sim_type,
+                        'exact_matches':         details['exact_count'],
+                        'moderate_matches':      details['moderate_count'],
+                        'weak_matches':          details['weak_count'],
+                        'segments':              json.dumps(details['segments']),
+                        'text_a':                fa['text'][:30000],
+                        'text_b':                fb['text'][:30000]
+                    }).execute()
+
+                    matches.append({
+                        'file_a':    fa,
+                        'file_b':    fb,
+                        'similarity': similarity,
+                        'details':   details
+                    })
+
+                await send_progress(ws_id, {
+                    'stage': 'comparison', 'progress': comparisons_done,
+                    'total': comparisons_total
+                })
+
+        # ── PHASE 3 : FINALISER ───────────────────────────────────────────────
+
+        supabase_client.table('analyses').update({
+            'status':                 'completed',
+            'completed_at':           datetime.now().isoformat(),
+            'total_comparisons':      comparisons_total,
+            'matches_above_threshold': len(matches),
+            'avg_similarity':         round(
+                sum(m['similarity'] for m in matches) / len(matches), 2
+            ) if matches else 0
+        }).eq('id', analysis_id).execute()
+
+        await send_progress(ws_id, {
+            'stage':       'complete',
+            'progress':    100,
+            'total':       100,
+            'message':     'Analyse terminée !',
+            'analysis_id': analysis_id,
+            'matches':     len(matches)
+        })
+
+        return {
+            "success":           True,
+            "analysis_id":       analysis_id,
+            "matches":           len(matches),
+            "total_comparisons": comparisons_total,
+            "total_files":       len(file_records)
+        }
+
+    except Exception as e:
+        if analysis_id:
+            try:
+                supabase_client.table('analyses').update({
+                    'status':        'failed',
+                    'error_message': str(e),
+                    'completed_at':  datetime.now().isoformat()
+                }).eq('id', analysis_id).execute()
+            except:
+                pass
+        print(f"[Direct] Error: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1489,8 +1667,18 @@ async def get_report_detail(analysis_id: str, report_id: str):
             try: segments = json.loads(segments)
             except: segments = {'exact': [], 'moderate': [], 'weak': []}
 
-        text_a = r['file_a']['content_text'] if r.get('file_a') else ''
-        text_b = r['file_b']['content_text'] if r.get('file_b') else ''
+        # text_a et text_b : d'abord depuis la colonne directe du rapport,
+        # sinon depuis la jointure file_a/file_b (cas analyze_single_file)
+        text_a = r.get('text_a') or (r['file_a']['content_text'] if r.get('file_a') else '')
+        text_b = r.get('text_b') or (r['file_b']['content_text'] if r.get('file_b') else '')
+
+        # Noms des fichiers : depuis la colonne directe OU depuis la jointure
+        file_a_name = r.get('file_a_name') or (r['file_a']['filename'] if r.get('file_a') else '—')
+        file_b_name = r.get('file_b_name') or (r['file_b']['filename'] if r.get('file_b') else '—')
+        file_a_words = (r['file_a']['word_count'] if r.get('file_a') else 0) or len(text_a.split())
+        file_b_words = (r['file_b']['word_count'] if r.get('file_b') else 0) or len(text_b.split())
+        file_a_lang  = (r['file_a']['language'] if r.get('file_a') else '') or 'document'
+        file_b_lang  = (r['file_b']['language'] if r.get('file_b') else '') or 'document'
 
         def build_colored_text(text: str, segs: dict, is_b: bool = False) -> list:
             """
@@ -1542,12 +1730,12 @@ async def get_report_detail(analysis_id: str, report_id: str):
                 "exact_matches":      r.get('exact_matches', 0),
                 "moderate_matches":   r.get('moderate_matches', 0),
                 "weak_matches":       r.get('weak_matches', 0),
-                "file_a_name":        r['file_a']['filename'] if r.get('file_a') else '—',
-                "file_b_name":        r['file_b']['filename'] if r.get('file_b') else '—',
-                "file_a_words":       r['file_a']['word_count'] if r.get('file_a') else 0,
-                "file_b_words":       r['file_b']['word_count'] if r.get('file_b') else 0,
-                "file_a_language":    r['file_a']['language'] if r.get('file_a') else '—',
-                "file_b_language":    r['file_b']['language'] if r.get('file_b') else '—',
+                "file_a_name":        file_a_name,
+                "file_b_name":        file_b_name,
+                "file_a_words":       file_a_words,
+                "file_b_words":       file_b_words,
+                "file_a_language":    file_a_lang,
+                "file_b_language":    file_b_lang,
                 "text_a_segments":    build_colored_text(text_a, segments, is_b=False),
                 "text_b_segments":    build_colored_text(text_b, segments, is_b=True),
             }
@@ -1719,8 +1907,14 @@ async def export_analysis_pdf(analysis_id: str):
             elif sim >= 15: rc, rv = '#CC9900', 'MODÉRÉE'
             else:           rc, rv = '#1E8449', 'FAIBLE'
 
-            fa_name = r['file_a']['filename'] if r.get('file_a') else '—'
-            fb_name = r['file_b']['filename'] if r.get('file_b') else '—'
+            # Lire le nom depuis la colonne directe en priorité (analyze_folder, direct_files)
+            # puis depuis la jointure file_a/file_b (analyze_single_file)
+            fa_name = (r.get('file_a_name')
+                       or (r['file_a']['filename'] if r.get('file_a') else None)
+                       or '—')
+            fb_name = (r.get('file_b_name')
+                       or (r['file_b']['filename'] if r.get('file_b') else None)
+                       or '—')
 
             table_data.append([
                 Paragraph(fa_name[:40], PS(f'ra{i}', fontSize=8, wordWrap='CJK')),
@@ -2796,6 +2990,104 @@ async def upload_single_file_to_db(
 # ─────────────────────────────────────────────────────────────────────────────
 # WEBSOCKET
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT CONTACT — Envoi direct d'email à plagify.etud@gmail.com
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/contact")
+async def send_contact_email(
+    nom:     str = Form(...),
+    email:   str = Form(...),
+    sujet:   str = Form(""),
+    message: str = Form(...)
+):
+    """
+    Envoie directement le message de contact à plagify.etud@gmail.com
+    via Gmail SMTP (port 587 TLS).
+    Variables d'environnement requises :
+      CONTACT_GMAIL_USER     = plagify.etud@gmail.com
+      CONTACT_GMAIL_PASSWORD = mot de passe d'application Gmail (16 caractères)
+    """
+    DEST_EMAIL   = "plagify.etud@gmail.com"
+    GMAIL_USER   = os.getenv("CONTACT_GMAIL_USER",     DEST_EMAIL)
+    GMAIL_PASS   = os.getenv("CONTACT_GMAIL_PASSWORD", "")
+
+    if not nom.strip() or not email.strip() or not message.strip():
+        raise HTTPException(400, "Nom, email et message sont obligatoires.")
+
+    # Validation email basique
+    import re as _re
+    if not _re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email.strip()):
+        raise HTTPException(400, "Adresse email invalide.")
+
+    sujet_complet = f"[PlaGiFY Contact] {sujet.strip() or 'Message de contact'}"
+
+    # Corps du mail en HTML
+    html_body = f"""
+    <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#1F2937;">
+      <div style="background:linear-gradient(135deg,#0B3D91,#0F7AC4);padding:28px 24px;border-radius:10px 10px 0 0;">
+        <h2 style="color:#fff;margin:0;font-size:1.3rem;">📬 Nouveau message — PlaGiFY</h2>
+      </div>
+      <div style="background:#F9FAFF;padding:24px;border:1px solid #D9E2EC;border-top:none;border-radius:0 0 10px 10px;">
+        <table style="width:100%;border-collapse:collapse;font-size:0.93rem;">
+          <tr>
+            <td style="padding:10px 0;border-bottom:1px solid #D9E2EC;color:#6B7280;width:120px;font-weight:600;">Expéditeur</td>
+            <td style="padding:10px 0;border-bottom:1px solid #D9E2EC;font-weight:700;color:#0B3D91;">{nom.strip()}</td>
+          </tr>
+          <tr>
+            <td style="padding:10px 0;border-bottom:1px solid #D9E2EC;color:#6B7280;font-weight:600;">Email</td>
+            <td style="padding:10px 0;border-bottom:1px solid #D9E2EC;">
+              <a href="mailto:{email.strip()}" style="color:#0F7AC4;">{email.strip()}</a>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:10px 0;border-bottom:1px solid #D9E2EC;color:#6B7280;font-weight:600;">Sujet</td>
+            <td style="padding:10px 0;border-bottom:1px solid #D9E2EC;">{sujet.strip() or "Non précisé"}</td>
+          </tr>
+          <tr>
+            <td style="padding:10px 0;color:#6B7280;font-weight:600;vertical-align:top;">Message</td>
+            <td style="padding:10px 0;">
+              <div style="background:#fff;border:1px solid #D9E2EC;border-radius:8px;padding:14px;line-height:1.7;white-space:pre-wrap;">{message.strip()}</div>
+            </td>
+          </tr>
+        </table>
+        <div style="margin-top:20px;padding:12px 16px;background:#E8F0FE;border-radius:8px;font-size:0.82rem;color:#0B3D91;">
+          Ce message a été envoyé depuis le formulaire de contact de PlaGiFY.
+          Répondez directement à <strong>{email.strip()}</strong>.
+        </div>
+      </div>
+    </body></html>
+    """
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = sujet_complet
+        msg["From"]    = f"PlaGiFY Contact <{GMAIL_USER}>"
+        msg["To"]      = DEST_EMAIL
+        msg["Reply-To"]= email.strip()
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(GMAIL_USER, GMAIL_PASS)
+            server.sendmail(GMAIL_USER, DEST_EMAIL, msg.as_string())
+
+        print(f"[Contact] Email envoyé depuis {email.strip()} → {DEST_EMAIL}")
+        return {"success": True, "message": "Votre message a bien été envoyé. Nous vous répondrons sous 24 à 48 heures."}
+
+    except smtplib.SMTPAuthenticationError:
+        print("[Contact] Erreur authentification Gmail SMTP")
+        raise HTTPException(503, "Service email temporairement indisponible. Contactez-nous directement à plagify.etud@gmail.com")
+    except smtplib.SMTPException as e:
+        print(f"[Contact] Erreur SMTP: {e}")
+        raise HTTPException(503, "Impossible d'envoyer l'email pour le moment. Réessayez dans quelques minutes.")
+    except Exception as e:
+        print(f"[Contact] Erreur inattendue: {e}")
+        traceback.print_exc()
+        raise HTTPException(500, "Erreur serveur. Contactez-nous directement à plagify.etud@gmail.com")
+
 
 @app.websocket("/ws/{ws_id}")
 async def websocket_endpoint(websocket: WebSocket, ws_id: str):
