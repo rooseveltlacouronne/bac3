@@ -254,6 +254,37 @@ def compute_hash(text: str) -> str:
     """Calcule le hash SHA256 du texte"""
     return hashlib.sha256(text.encode('utf-8', errors='ignore')).hexdigest()
 
+
+def increment_teacher_stats(teacher_id: str, analyses_by: int = 0, reports_by: int = 0) -> None:
+    """
+    ═══════════════════════════════════════════════════════════════════════════
+    CORRECTION BUGS #1 et #2 (statistiques) :
+    Incrémente de façon ATOMIQUE et CUMULATIVE (jamais décrémentée) les compteurs
+    'total_analyses_created' et 'total_reports_created' sur la table teachers.
+
+    Ces compteurs sont volontairement indépendants des tables 'analyses' et
+    'similarity_reports' : quand l'utilisateur supprime une analyse (ou ses
+    rapports), CES compteurs ne bougent JAMAIS. Ils reflètent donc le nombre
+    RÉEL d'analyses/rapports générés depuis toujours, peu importe les
+    suppressions ultérieures.
+
+    Utilise la fonction SQL 'increment_teacher_stat' (voir migration SQL) pour
+    éviter toute condition de course lors d'incréments concurrents.
+    ═══════════════════════════════════════════════════════════════════════════
+    """
+    if not teacher_id or (analyses_by == 0 and reports_by == 0):
+        return
+    try:
+        supabase_client.rpc('increment_teacher_stat', {
+            'p_teacher_id': teacher_id,
+            'p_analyses_by': analyses_by,
+            'p_reports_by': reports_by
+        }).execute()
+    except Exception as e:
+        # Ne doit jamais faire échouer l'analyse en cours à cause d'un problème de stats
+        print(f"[Stats] Erreur incrément compteurs teacher {teacher_id}: {e}")
+        traceback.print_exc()
+
 def calculate_similarity(text1: str, text2: str) -> tuple[float, dict]:
     """
     Calcule la similarité entre deux textes avec segments colorés
@@ -1080,6 +1111,7 @@ async def analyze_folder(
         }).execute()
         
         analysis_id = analysis.data[0]['id']
+        increment_teacher_stats(teacher_id, analyses_by=1)
         
         # ═══════════════════════════════════════════════════════════════════════════════
         # PHASE 1: EXTRACTION (avec progression temps réel)
@@ -1227,6 +1259,9 @@ async def analyze_folder(
             'avg_similarity': round(sum(m['similarity'] for m in matches) / len(matches), 2) if matches else 0
         }).eq('id', analysis_id).execute()
         
+        if matches:
+            increment_teacher_stats(teacher_id, reports_by=len(matches))
+        
         await send_progress(ws_id, {
             'stage': 'complete',
             'progress': 100,
@@ -1292,6 +1327,7 @@ async def analyze_direct_files(
         }).execute()
 
         analysis_id = analysis.data[0]['id']
+        increment_teacher_stats(teacher_id, analyses_by=1)
 
         # ── PHASE 1 : EXTRACTION ──────────────────────────────────────────────
         await send_progress(ws_id, {
@@ -1412,6 +1448,9 @@ async def analyze_direct_files(
             ) if matches else 0
         }).eq('id', analysis_id).execute()
 
+        if matches:
+            increment_teacher_stats(teacher_id, reports_by=len(matches))
+
         await send_progress(ws_id, {
             'stage':       'complete',
             'progress':    100,
@@ -1476,6 +1515,7 @@ async def analyze_single_file(
         }).execute()
         
         analysis_id = analysis.data[0]['id']
+        increment_teacher_stats(teacher_id, analyses_by=1)
         
         temp_path = UPLOAD_DIR / f"{analysis_id}_{safe_filename}"
         file_bytes = await file.read()
@@ -1583,6 +1623,9 @@ async def analyze_single_file(
             'total_files': 1,
             'avg_similarity': round(sum(m['similarity'] for m in matches) / len(matches), 2) if matches else 0
         }).eq('id', analysis_id).execute()
+        
+        if matches:
+            increment_teacher_stats(teacher_id, reports_by=len(matches))
         
         await send_progress(ws_id, {
             'stage': 'complete',
@@ -2340,27 +2383,38 @@ async def export_ai_pdf(
 
 @app.get("/api/statistics/{teacher_id}")
 async def get_statistics(teacher_id: str):
+    """
+    ═══════════════════════════════════════════════════════════════════════════
+    CORRECTION BUGS #1 et #2 :
+    'total_analyses' et 'total_reports' NE sont PLUS comptés en direct depuis
+    les tables 'analyses' / 'similarity_reports' (ce qui les faisait diminuer
+    dès qu'une analyse était supprimée). Ils viennent désormais des compteurs
+    CUMULATIFS stockés sur 'teachers' (total_analyses_created / total_reports_created),
+    incrémentés une seule fois à la création de chaque analyse/rapport et jamais
+    décrémentés, même après suppression.
+    'total_files' reste un comptage en direct (nombre de fichiers réellement
+    présents en base actuellement), ce qui est le comportement attendu pour ce champ.
+    ═══════════════════════════════════════════════════════════════════════════
+    """
     try:
         files_result = supabase_client.table('files').select('id', count='exact').eq('teacher_id', teacher_id).execute()
         total_files = files_result.count if files_result.count else 0
-        
-        analyses_result = supabase_client.table('analyses').select('id', count='exact').eq('teacher_id', teacher_id).execute()
-        total_analyses = analyses_result.count if analyses_result.count else 0
-        
-        if total_analyses > 0:
-            analyses_ids_result = supabase_client.table('analyses').select('id').eq('teacher_id', teacher_id).execute()
-            analyses_ids = [a['id'] for a in analyses_ids_result.data]
-            
-            if analyses_ids:
-                reports_result = supabase_client.table('similarity_reports').select('id', count='exact').in_('analysis_id', analyses_ids).execute()
-                total_reports = reports_result.count if reports_result.count else 0
-            else:
-                total_reports = 0
+
+        teacher_result = supabase_client.table('teachers').select(
+            'total_analyses_created, total_reports_created'
+        ).eq('id', teacher_id).execute()
+
+        if teacher_result.data:
+            total_analyses = teacher_result.data[0].get('total_analyses_created') or 0
+            total_reports = teacher_result.data[0].get('total_reports_created') or 0
         else:
+            total_analyses = 0
             total_reports = 0
-        
+
         return {"success": True, "data": {"total_files": total_files, "total_analyses": total_analyses, "total_reports": total_reports}}
     except Exception as e:
+        print(f"[Stats] Erreur get_statistics: {e}")
+        traceback.print_exc()
         return {"success": True, "data": {"total_files": 0, "total_analyses": 0, "total_reports": 0}}
 
 
@@ -2369,155 +2423,245 @@ async def get_statistics(teacher_id: str):
 # ─────────────────────────────────────────────────────────────────────────────
 # GOOGLE DRIVE — TÂCHE DE SURVEILLANCE EN ARRIÈRE-PLAN
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# CORRECTION BUGS #3 et #4 (ré-écriture complète) :
+#
+#   Bug #3 — L'analyse Google Drive ne détectait pas les fichiers de même
+#   contenu mais de nom différent, contrairement à l'analyse de dossier.
+#   Cause racine : l'ancien code comparait chaque NOUVEAU fichier uniquement
+#   contre les fichiers déjà enregistrés en base, et surtout, si un fichier
+#   avait le même hash SHA256 qu'un fichier déjà connu, il était purement et
+#   simplement IGNORÉ (aucune comparaison, aucun rapport). Deux fichiers
+#   dupliqués renommés reçus dans le même cycle ne pouvaient donc jamais être
+#   rapprochés. La liste des fichiers Drive n'était en plus récupérée que sur
+#   une seule page (pageSize=100 sans pagination), donc un dossier de plus de
+#   100 fichiers par niveau n'était analysé que PARTIELLEMENT.
+#
+#   Bug #4 — Tous les fichiers du Drive étaient automatiquement insérés dans
+#   la table `files` lors de l'analyse. Ce n'est plus le cas : les fichiers
+#   Google Drive ne sont JAMAIS écrits dans la table `files`. Le contenu
+#   téléchargé reste uniquement en mémoire (cache par surveillance), exactement
+#   comme pour l'analyse de dossier / import direct.
+#
+#   Nouvelle approche : à CHAQUE cycle (toutes les 60s), on liste TOUS les
+#   fichiers actuellement présents dans le dossier Drive (récursivement, avec
+#   pagination complète), on télécharge/extrait le texte des fichiers
+#   nouveaux ou modifiés (cache par modifiedTime pour éviter de re-télécharger
+#   l'inchangé), puis on effectue une comparaison EXHAUSTIVE de TOUS les
+#   fichiers entre eux — exactement le même algorithme (`calculate_similarity`)
+#   que l'analyse de dossier classique, qui elle fonctionne parfaitement.
+#   Les similarity_reports sont ensuite synchronisés (ajout des nouvelles
+#   correspondances, suppression de celles qui ne sont plus valides) afin que
+#   le tableau récapitulatif reflète toujours fidèlement l'état actuel du Drive.
+# ─────────────────────────────────────────────────────────────────────────────
 
-async def process_drive_file(
-    drive_service,
-    file_info: dict,
-    monitor_data: dict,
-    analysis_id: str
-) -> Optional[dict]:
+# Cache mémoire par surveillance : { monitor_id: { drive_file_id: {filename, text, language, word_count, size, modifiedTime} } }
+# Les fichiers Google Drive ne sont JAMAIS persistés dans la table `files` (Bug #4).
+drive_files_cache: dict = {}
+
+
+def _list_drive_files_recursive(service, parent_id: str) -> list:
     """
-    Télécharge un fichier depuis Google Drive, extrait son texte,
-    l'enregistre en base. Retourne le record créé ou None si échec.
+    Liste RÉCURSIVEMENT et EXHAUSTIVEMENT (avec pagination complète) tous les
+    fichiers d'un dossier Drive et de ses sous-dossiers.
+    Corrige le Bug #3 : l'ancienne version ne récupérait que la première page
+    (100 fichiers max) de chaque dossier, donc une partie du Drive pouvait ne
+    jamais être analysée si le dossier contenait plus de 100 fichiers.
     """
-    teacher_id  = monitor_data['teacher_id']
-    monitor_id  = monitor_data['id']
-    threshold   = monitor_data.get('similarity_threshold', 15.0)
+    all_files = []
 
-    raw_name    = file_info['name']
-    safe_name   = sanitize_filename(raw_name)
-    ext         = Path(safe_name).suffix.lower()
+    def _walk(pid: str):
+        page_token = None
+        while True:
+            try:
+                results = service.files().list(
+                    q=f"'{pid}' in parents and trashed=false",
+                    fields="nextPageToken, files(id, name, mimeType, modifiedTime, size)",
+                    orderBy="modifiedTime desc",
+                    pageSize=100,
+                    pageToken=page_token
+                ).execute()
+            except Exception as list_err:
+                print(f"[Drive] Erreur listage dossier {pid}: {list_err}")
+                return
 
-    if ext not in VALID_EXTENSIONS:
-        print(f"[Drive] Extension ignorée: {raw_name}")
-        return None
+            items = results.get('files', [])
+            for item in items:
+                if item['mimeType'] == 'application/vnd.google-apps.folder':
+                    _walk(item['id'])
+                else:
+                    all_files.append(item)
 
-    temp_path = TEMP_DIR / f"gdrive_{monitor_id}_{safe_name}"
+            page_token = results.get('nextPageToken')
+            if not page_token:
+                break
 
-    try:
-        # ── Télécharger depuis Drive ───────────────────────────────────────
-        request  = drive_service.files().get_media(fileId=file_info['id'])
-        fh       = BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
+    _walk(parent_id)
+    return all_files
 
-        temp_path.write_bytes(fh.getvalue())
 
-        # ── Extraire texte ─────────────────────────────────────────────────
-        text, language = extract_text_from_file(temp_path)
-        content_hash   = compute_hash(text)
-        file_size      = len(fh.getvalue())
+async def sync_drive_folder_and_analyze(service, monitor_data: dict, analysis_id: str) -> dict:
+    """
+    Télécharge (en mémoire uniquement, jamais en base — Bug #4) et compare de
+    façon EXHAUSTIVE tous les fichiers actuellement présents dans le dossier
+    Google Drive surveillé, avec le même algorithme que l'analyse de dossier
+    (Bug #3). Synchronise ensuite les similarity_reports avec l'état constaté.
+    """
+    monitor_id = monitor_data['id']
+    teacher_id = monitor_data['teacher_id']
+    threshold  = float(monitor_data.get('similarity_threshold', 15.0) or 15.0)
+    folder_id  = monitor_data['drive_folder_id']
 
-        # ── Vérifier doublon par hash ──────────────────────────────────────
-        existing_hash = supabase_client.table('files').select('id').eq(
-            'content_hash', content_hash
-        ).eq('teacher_id', teacher_id).execute()
+    cache = drive_files_cache.setdefault(monitor_id, {})
 
-        if existing_hash.data:
-            print(f"[Drive] Fichier déjà en base (même hash): {raw_name}")
-            temp_path.unlink(missing_ok=True)
-            return None
+    # ── 1) Lister EXHAUSTIVEMENT tous les fichiers actuellement dans le Drive ──
+    drive_items = _list_drive_files_recursive(service, folder_id)
+    print(f"[Drive] {len(drive_items)} fichier(s) trouvé(s) au total dans le dossier (récursif, pagination complète)")
 
-        # ── Uploader vers Supabase Storage ─────────────────────────────────
-        storage_path = f"google_drive/{monitor_id}/{safe_name}"
+    current_ids = set()
+    for item in drive_items:
+        drive_id  = item['id']
+        safe_name = sanitize_filename(item['name'])
+        ext       = Path(safe_name).suffix.lower()
+
+        if ext not in VALID_EXTENSIONS:
+            continue
+
+        current_ids.add(drive_id)
+
+        cached = cache.get(drive_id)
+        if cached and cached.get('modifiedTime') == item.get('modifiedTime'):
+            # Fichier inchangé depuis le dernier cycle — inutile de le re-télécharger
+            continue
+
+        temp_path = TEMP_DIR / f"gdrive_{monitor_id}_{drive_id}_{safe_name}"
         try:
-            get_bucket('plagify-files').upload(
-                storage_path,
-                fh.getvalue(),
-                {'content-type': 'application/octet-stream', 'upsert': 'true'}
-            )
-        except Exception as se:
-            print(f"[Drive] Storage upload non critique: {se}")
+            request    = service.files().get_media(fileId=drive_id)
+            fh         = BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
 
-        # ── Enregistrer en base ────────────────────────────────────────────
-        file_record = supabase_client.table('files').insert({
-            'teacher_id':    teacher_id,
-            'filename':      safe_name,
-            'original_path': f"gdrive://{file_info['id']}",
-            'storage_path':  storage_path,
-            'file_type':     ext,
-            'file_size':     file_size,
-            'content_text':  text[:50000],
-            'content_hash':  content_hash,
-            'word_count':    len(text.split()),
-            'language':      language
+            temp_path.write_bytes(fh.getvalue())
+            text, language = extract_text_from_file(temp_path)
+
+            cache[drive_id] = {
+                'filename':     safe_name,
+                'text':         text,
+                'language':     language,
+                'word_count':   len(text.split()),
+                'size':         len(fh.getvalue()),
+                'modifiedTime': item.get('modifiedTime'),
+            }
+            print(f"[Drive] ✅ Téléchargé et extrait : {safe_name}")
+        except Exception as e:
+            print(f"[Drive] ❌ Erreur téléchargement {item.get('name')}: {e}")
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    # ── 2) Retirer du cache les fichiers qui ne sont plus présents dans le Drive ──
+    for stale_id in [fid for fid in cache if fid not in current_ids]:
+        del cache[stale_id]
+
+    file_records = [{'drive_id': fid, **data} for fid, data in cache.items()]
+
+    # ── 3) Comparaison EXHAUSTIVE de TOUS les fichiers entre eux (même algo que l'analyse de dossier) ──
+    current_matches: dict = {}  # key: frozenset({drive_id_a, drive_id_b}) -> match data
+    for i in range(len(file_records)):
+        for j in range(i + 1, len(file_records)):
+            fa, fb = file_records[i], file_records[j]
+            similarity, details = calculate_similarity(fa['text'], fb['text'])
+
+            if similarity >= threshold:
+                lang = fa['language']
+                sim_type = (
+                    f"{'Code' if lang in ['Python', 'Java', 'C', 'JavaScript', 'PHP'] else 'Texte'}"
+                    f" — {'Exact' if similarity > 80 else 'Modéré' if similarity > 50 else 'Partiel'}"
+                    f" (Google Drive)"
+                )
+                key = frozenset({fa['drive_id'], fb['drive_id']})
+                current_matches[key] = {
+                    'file_a_name':           fa['filename'],
+                    'file_b_name':           fb['filename'],
+                    'similarity_percentage': similarity,
+                    'similarity_type':       sim_type,
+                    'exact_matches':         details['exact_count'],
+                    'moderate_matches':      details['moderate_count'],
+                    'weak_matches':          details['weak_count'],
+                    'segments':              json.dumps(details['segments']),
+                    'text_a':                fa['text'][:30000],
+                    'text_b':                fb['text'][:30000],
+                }
+
+    # ── 4) Synchroniser les similarity_reports existants avec l'état actuel ──
+    # (les paires sont identifiées par leurs noms de fichiers puisque file_a_id/file_b_id
+    #  sont NULL — les fichiers Drive ne sont jamais insérés dans `files`, Bug #4)
+    existing = supabase_client.table('similarity_reports').select(
+        'id, file_a_name, file_b_name'
+    ).eq('analysis_id', analysis_id).execute()
+
+    existing_by_names = {
+        frozenset({r['file_a_name'], r['file_b_name']}): r['id'] for r in existing.data
+    }
+    current_by_names = {
+        frozenset({m['file_a_name'], m['file_b_name']}): m for m in current_matches.values()
+    }
+
+    # Supprimer les rapports dont la paire n'est plus valide (fichier supprimé du Drive,
+    # renommé ou similarité repassée sous le seuil)
+    to_delete = [rid for key, rid in existing_by_names.items() if key not in current_by_names]
+    if to_delete:
+        supabase_client.table('similarity_reports').delete().in_('id', to_delete).execute()
+
+    # Insérer uniquement les NOUVELLES correspondances détectées
+    new_reports_count = 0
+    for key, match in current_by_names.items():
+        if key in existing_by_names:
+            continue
+        supabase_client.table('similarity_reports').insert({
+            'analysis_id': analysis_id,
+            'file_a_id':   None,
+            'file_b_id':   None,
+            **match
         }).execute()
+        new_reports_count += 1
 
-        new_file = {
-            'id':         file_record.data[0]['id'],
-            'text':       text,
-            'filename':   safe_name,
-            'language':   language,
-            'word_count': len(text.split()),
-            'size':       file_size,
-            'path':       temp_path,
-        }
+    if new_reports_count > 0:
+        # Compteur cumulatif jamais décrémenté (Bug #1 / #2)
+        increment_teacher_stats(teacher_id, reports_by=new_reports_count)
 
-        # ── Comparer avec tous les autres fichiers du même monitor ─────────
-        other_files = supabase_client.table('files').select('*').eq(
-            'teacher_id', teacher_id
-        ).neq('id', new_file['id']).execute()
+    # ── 5) Mettre à jour les statistiques LIVE de l'analyse (reflète l'état actuel du Drive) ──
+    total_comparisons = len(file_records) * (len(file_records) - 1) // 2
+    matches_count = len(current_matches)
+    avg_similarity = round(
+        sum(m['similarity_percentage'] for m in current_matches.values()) / matches_count, 2
+    ) if matches_count else 0
 
-        matches = []
-        for db_file in other_files.data:
-            sim, det = calculate_similarity(text, db_file.get('content_text') or '')
-            if sim >= threshold:
-                rr = supabase_client.table('similarity_reports').insert({
-                    'analysis_id':           analysis_id,
-                    'file_a_id':             new_file['id'],
-                    'file_b_id':             db_file['id'],
-                    # CORRECTION CRITIQUE: stocker les noms directement
-                    'file_a_name':           safe_name,
-                    'file_b_name':           db_file['filename'],
-                    'similarity_percentage': sim,
-                    'similarity_type':       'Google Drive - Surveillance automatique',
-                    'exact_matches':         det['exact_count'],
-                    'moderate_matches':      det['moderate_count'],
-                    'weak_matches':          det['weak_count'],
-                    'segments':              json.dumps(det['segments'])
-                }).execute()
+    supabase_client.table('analyses').update({
+        'total_files':             len(file_records),
+        'total_comparisons':       total_comparisons,
+        'matches_above_threshold': matches_count,
+        'avg_similarity':          avg_similarity,
+    }).eq('id', analysis_id).execute()
 
-                # Pas de PDF individuel — tableau interactif uniquement
-                # Le PDF récapitulatif est généré à la demande via /api/analyses/{id}/export-pdf
-                matches.append({
-                    'db_file':    db_file['filename'],
-                    'similarity': sim,
-                })
-
-        # ── Mettre à jour les stats de l'analyse ───────────────────────────
-        if matches:
-            supabase_client.table('analyses').update({
-                'matches_above_threshold': supabase_client.table('similarity_reports').select(
-                    'id', count='exact'
-                ).eq('analysis_id', analysis_id).execute().count or 0,
-                'total_comparisons': len(other_files.data),
-            }).eq('id', analysis_id).execute()
-
-        temp_path.unlink(missing_ok=True)
-        print(f"[Drive] ✅ {raw_name} traité — {len(matches)} correspondance(s)")
-        return new_file
-
-    except Exception as e:
-        print(f"[Drive] ❌ Erreur traitement {raw_name}: {e}")
-        traceback.print_exc()
-        temp_path.unlink(missing_ok=True)
-        return None
+    return {
+        'total_files': len(file_records),
+        'new_reports': new_reports_count,
+        'matches':     matches_count,
+    }
 
 
 async def monitor_drive_folder(monitor_id: str):
     """
     Tâche asyncio qui surveille un dossier Google Drive en continu.
     - Vérifie toutes les 60 secondes
-    - Détecte les nouveaux fichiers par leur Drive ID
-    - Analyse chaque nouveau fichier contre tous les fichiers existants
-    - Génère des rapports PDF automatiquement
+    - À chaque cycle, ré-analyse EXHAUSTIVEMENT tous les fichiers du dossier
+      (Bug #3), sans jamais les enregistrer dans la table `files` (Bug #4)
     - S'arrête quand is_active passe à False ou quand le monitor est supprimé
     """
     print(f"[Drive] 🟢 Surveillance démarrée pour monitor {monitor_id[:8]}")
 
-    # Récupérer ou créer l'analyse associée à ce monitor
     monitor_rec = supabase_client.table('google_drive_monitors').select('*').eq(
         'id', monitor_id).execute()
 
@@ -2527,14 +2671,14 @@ async def monitor_drive_folder(monitor_id: str):
 
     monitor_data = monitor_rec.data[0]
     teacher_id   = monitor_data['teacher_id']
+    source_name  = f"Google Drive — {monitor_data['drive_link'][:60]}"
 
-    # Créer une analyse de type google_drive pour regrouper tous les rapports
-    # Vérifier si une analyse google_drive existe déjà pour ce teacher + monitor
+    # Reprendre une analyse existante pour ce monitor si elle est encore "processing"
     # (évite de créer une nouvelle analyse à chaque redémarrage du serveur)
     existing_analysis = supabase_client.table('analyses').select('id').eq(
         'teacher_id', teacher_id
     ).eq('analysis_type', 'google_drive').eq(
-        'source_name', f"Google Drive — {monitor_data['drive_link'][:60]}"
+        'source_name', source_name
     ).eq('status', 'processing').execute()
 
     if existing_analysis.data:
@@ -2545,24 +2689,14 @@ async def monitor_drive_folder(monitor_id: str):
             'teacher_id':           teacher_id,
             'establishment_id':     monitor_data.get('establishment_id'),
             'analysis_type':        'google_drive',
-            'source_name':          f"Google Drive — {monitor_data['drive_link'][:60]}",
+            'source_name':          source_name,
             'similarity_threshold': monitor_data.get('similarity_threshold', 15.0),
             'status':               'processing',
             'total_files':          0
         }).execute()
         analysis_id = analysis.data[0]['id']
+        increment_teacher_stats(teacher_id, analyses_by=1)
         print(f"[Drive] Nouvelle analyse créée: {analysis_id[:8]}")
-
-    # Ensemble des IDs Drive déjà vus pour ne pas retraiter
-    already_seen: set = set()
-
-    # Pré-remplir avec les fichiers déjà en base pour ce monitor
-    existing = supabase_client.table('files').select('original_path').eq(
-        'teacher_id', teacher_id
-    ).like('original_path', 'gdrive://%').execute()
-    for f in existing.data:
-        drive_id = f['original_path'].replace('gdrive://', '')
-        already_seen.add(drive_id)
 
     while True:
         try:
@@ -2581,76 +2715,23 @@ async def monitor_drive_folder(monitor_id: str):
                 await asyncio.sleep(60)
                 continue
 
-            # Créer le service Google Drive
             service = get_drive_service()
             if not service:
                 print(f"[Drive] Service Google Drive indisponible — retry dans 60s")
                 await asyncio.sleep(60)
                 continue
 
-            folder_id = monitor_data['drive_folder_id']
+            result = await sync_drive_folder_and_analyze(service, monitor_data, analysis_id)
 
-            # ── Lister TOUS les fichiers du dossier Drive ──────────────────
-            # Inclut aussi les sous-dossiers récursivement
-            all_drive_files = []
-
-            def list_files_recursive(parent_id: str):
-                """Liste récursivement tous les fichiers dans un dossier Drive"""
-                try:
-                    results = service.files().list(
-                        q=f"'{parent_id}' in parents and trashed=false",
-                        fields="files(id, name, mimeType, modifiedTime, size)",
-                        orderBy="modifiedTime desc",
-                        pageSize=100
-                    ).execute()
-                    items = results.get('files', [])
-                    for item in items:
-                        if item['mimeType'] == 'application/vnd.google-apps.folder':
-                            # C'est un sous-dossier — descendre dedans
-                            list_files_recursive(item['id'])
-                        else:
-                            # C'est un fichier
-                            all_drive_files.append(item)
-                except Exception as list_err:
-                    print(f"[Drive] Erreur listage dossier {parent_id}: {list_err}")
-
-            list_files_recursive(folder_id)
-
-            print(f"[Drive] {len(all_drive_files)} fichier(s) trouvé(s) dans le Drive")
-
-            # ── Traiter les nouveaux fichiers ──────────────────────────────
-            new_files_count = 0
-            for file_item in all_drive_files:
-                if file_item['id'] in already_seen:
-                    continue
-
-                # Nouveau fichier détecté !
-                print(f"[Drive] 🆕 Nouveau fichier: {file_item['name']}")
-                result = await process_drive_file(
-                    service, file_item, monitor_data, analysis_id
-                )
-                if result is not None:
-                    already_seen.add(file_item['id'])
-                    new_files_count += 1
-                else:
-                    # Marquer comme vu même si ignoré (extension invalide, etc.)
-                    already_seen.add(file_item['id'])
-
-            # ── Mettre à jour last_check ───────────────────────────────────
             supabase_client.table('google_drive_monitors').update({
                 'last_check':      datetime.now().isoformat(),
-                'last_file_count': len(all_drive_files)
+                'last_file_count': result['total_files']
             }).eq('id', monitor_id).execute()
 
-            # Mettre à jour le total de fichiers dans l'analyse
-            supabase_client.table('analyses').update({
-                'total_files': len(already_seen)
-            }).eq('id', analysis_id).execute()
-
-            if new_files_count > 0:
-                print(f"[Drive] ✅ {new_files_count} nouveau(x) fichier(s) traité(s)")
+            if result['new_reports'] > 0:
+                print(f"[Drive] ✅ {result['new_reports']} nouvelle(s) correspondance(s) — {result['total_files']} fichier(s) analysé(s), {result['matches']} match(s) au total")
             else:
-                print(f"[Drive] Aucun nouveau fichier — prochain check dans 60s")
+                print(f"[Drive] {result['total_files']} fichier(s) analysé(s), {result['matches']} match(s) — aucune nouveauté — prochain check dans 60s")
 
         except Exception as e:
             print(f"[Drive] ❌ Erreur monitor {monitor_id[:8]}: {e}")
@@ -2667,6 +2748,9 @@ async def monitor_drive_folder(monitor_id: str):
         }).eq('id', analysis_id).execute()
     except Exception:
         pass
+
+    # Libérer le cache mémoire de cette surveillance
+    drive_files_cache.pop(monitor_id, None)
 
     print(f"[Drive] 🔴 Surveillance arrêtée pour monitor {monitor_id[:8]}")
 
@@ -2871,6 +2955,10 @@ async def delete_drive_monitor(monitor_id: str):
         if monitor_id in active_monitors:
             active_monitors[monitor_id].cancel()
             del active_monitors[monitor_id]
+
+        # La tâche étant annulée (pas arrêtée proprement), son propre nettoyage
+        # de cache ne s'exécute pas — on le fait donc explicitement ici.
+        drive_files_cache.pop(monitor_id, None)
 
         # Désactiver d'abord pour que la tâche s'arrête proprement
         supabase_client.table('google_drive_monitors').update({
